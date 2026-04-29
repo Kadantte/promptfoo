@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.121.10](https://github.com/promptfoo/promptfoo/compare/0.121.9...0.121.10) (2026-04-29)
+
+
+### Features
+
+* **claude-agent-sdk:** bump SDK to 0.2.120 and expose new options ([#8946](https://github.com/promptfoo/promptfoo/issues/8946)) ([350a24c](https://github.com/promptfoo/promptfoo/commit/350a24c31468553468f8228d26f5fdacbe3ae94f))
+* **cli:** add eval filter range ([#8895](https://github.com/promptfoo/promptfoo/issues/8895)) ([f049dd3](https://github.com/promptfoo/promptfoo/commit/f049dd3cd130378d8f719c308e6c8def3b294157))
+* **openapi:** generate server spec from route DTOs ([#8928](https://github.com/promptfoo/promptfoo/issues/8928)) ([c92102b](https://github.com/promptfoo/promptfoo/commit/c92102b077d0c2f99fa23c9634d92e9f57c69a9e))
+
+
+### Bug Fixes
+
+* **api:** add DTO validation for core server routes ([#8922](https://github.com/promptfoo/promptfoo/issues/8922)) ([87f637f](https://github.com/promptfoo/promptfoo/commit/87f637f9ce208eb9317b6a77afa727876b863a51))
+* **api:** validate eval route DTOs ([#8924](https://github.com/promptfoo/promptfoo/issues/8924)) ([84d5c8c](https://github.com/promptfoo/promptfoo/commit/84d5c8c56716af761e21d6b4ec3d63930de31ffe))
+* **api:** validate media, blob, user, and trace DTOs ([#8923](https://github.com/promptfoo/promptfoo/issues/8923)) ([9a313f5](https://github.com/promptfoo/promptfoo/commit/9a313f5c174ba6e602986301971e11e20da7fb2b))
+* **api:** validate model audit route DTOs ([#8927](https://github.com/promptfoo/promptfoo/issues/8927)) ([684ae81](https://github.com/promptfoo/promptfoo/commit/684ae812724e118fa2ca00e3199f0354f148b017))
+* **api:** validate provider route DTOs ([#8925](https://github.com/promptfoo/promptfoo/issues/8925)) ([b761730](https://github.com/promptfoo/promptfoo/commit/b76173059f42a0a15dea2858562d73733bd1e6a8))
+* **app:** make update banner dismiss button clickable ([#8942](https://github.com/promptfoo/promptfoo/issues/8942)) ([79a2864](https://github.com/promptfoo/promptfoo/commit/79a2864fea8eff599289c68f411f12b90d02d74f))
+* **assertions:** avoid slow XML candidate matching ([#8941](https://github.com/promptfoo/promptfoo/issues/8941)) ([df029d2](https://github.com/promptfoo/promptfoo/commit/df029d203f7885e3ed245c156dd1493f6eed22d7))
+* **assertions:** support indexed XML paths ([#8970](https://github.com/promptfoo/promptfoo/issues/8970)) ([bd3969f](https://github.com/promptfoo/promptfoo/commit/bd3969fc08679156b320a239632b97052f66b8f0))
+* **code-scan:** honor enable-fork-prs ([#8938](https://github.com/promptfoo/promptfoo/issues/8938)) ([517ec9d](https://github.com/promptfoo/promptfoo/commit/517ec9d3a0589be726bf024ea7d38bc28bb46702))
+* **eval:** delete traces with eval records ([#8973](https://github.com/promptfoo/promptfoo/issues/8973)) ([a395551](https://github.com/promptfoo/promptfoo/commit/a395551503dc63851b52a74c5c9ed97351cf19f2))
+* **eval:** harden OpenAI media blob exports ([#8876](https://github.com/promptfoo/promptfoo/issues/8876)) ([9d4948b](https://github.com/promptfoo/promptfoo/commit/9d4948bfa7318e422ddbf8367972c227e8285c9e))
+* **eval:** honor sharing disable for blob uploads ([#8940](https://github.com/promptfoo/promptfoo/issues/8940)) ([77fa02a](https://github.com/promptfoo/promptfoo/commit/77fa02ad89ecab4c5ca3424b1f879e9ec4a366c0))
+* **eval:** preserve filter range on resume ([#8960](https://github.com/promptfoo/promptfoo/issues/8960)) ([cd16d65](https://github.com/promptfoo/promptfoo/commit/cd16d652ae79a4dcf178df74af943adc21a601a4))
+* **eval:** stop HuggingFace empty-page loops ([#8939](https://github.com/promptfoo/promptfoo/issues/8939)) ([56b3c9f](https://github.com/promptfoo/promptfoo/commit/56b3c9fc9533082c832749e68379119ee7be173e))
+* **redteam:** validate redteam route DTOs ([#8926](https://github.com/promptfoo/promptfoo/issues/8926)) ([1b8c4fb](https://github.com/promptfoo/promptfoo/commit/1b8c4fbfa2ac2cc27b219f5bd7c37d7833b3cecd))
+* **test:** prevent test-hygiene race with parallel fixture writers ([#8948](https://github.com/promptfoo/promptfoo/issues/8948)) ([549e2b7](https://github.com/promptfoo/promptfoo/commit/549e2b760a0e67c6871e3a31e29ffb92e347df7a))
+
+
+### Performance Improvements
+
+* **providers/http:** parallelize createHttpsAgent file reads ([#8956](https://github.com/promptfoo/promptfoo/issues/8956)) ([108c80b](https://github.com/promptfoo/promptfoo/commit/108c80be3d19b66c80592eb7b4431e45d58c2ccd))
+
 ## [0.121.9](https://github.com/promptfoo/promptfoo/compare/0.121.8...0.121.9) (2026-04-27)
 
 ### Features
