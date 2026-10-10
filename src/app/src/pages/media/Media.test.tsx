@@ -2,7 +2,7 @@ import { TooltipProvider } from '@app/components/ui/tooltip';
 import { mockIntersectionObserver } from '@app/tests/browserMocks';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { MediaItem } from './types';
@@ -18,11 +18,16 @@ vi.mock('@app/hooks/useTelemetry', () => ({
 }));
 
 // Mock thumbnail cache cleanup
+vi.mock('@app/utils/media', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@app/utils/media')>()),
+  downloadFile: vi.fn(),
+}));
 vi.mock('./hooks/useThumbnailCache', () => ({
   clearExpiredThumbnails: () => Promise.resolve(),
 }));
 
 import { callApi } from '@app/utils/api';
+import { downloadFile } from '@app/utils/media';
 import Media from './Media';
 
 // Helper to capture current location for assertions
@@ -128,6 +133,80 @@ describe('Media page URL state machine', () => {
       expect(screen.getByText('First item')).toBeInTheDocument();
       expect(screen.getByText('Second item')).toBeInTheDocument();
     });
+  });
+
+  it('stacks the page header before the narrow layout has enough room', async () => {
+    mockApiResponses();
+    renderMedia();
+
+    await waitFor(() => {
+      expect(screen.getByText('First item')).toBeInTheDocument();
+    });
+
+    expect(
+      screen.getByRole('heading', { name: 'Media Library' }).parentElement?.parentElement,
+    ).toHaveClass('flex-col', 'min-[390px]:flex-row');
+  });
+
+  it('allows selection controls to wrap on narrow layouts', async () => {
+    const user = userEvent.setup();
+    mockApiResponses();
+    renderMedia();
+
+    await waitFor(() => {
+      expect(screen.getByText('First item')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getAllByRole('button', { name: /^Download$/ })[0]);
+    await user.click(screen.getByRole('menuitem', { name: /Select Items/i }));
+
+    expect(screen.getByText('0 of 2 selected').parentElement).toHaveClass('flex-wrap');
+  });
+
+  it('allows the header actions to wrap while a bulk download is running', async () => {
+    const user = userEvent.setup();
+    mockApiResponses();
+    renderMedia();
+
+    await waitFor(() => {
+      expect(screen.getByText('First item')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getAllByRole('button', { name: /^Download$/ })[0]);
+    await user.click(screen.getByRole('menuitem', { name: /Select Items/i }));
+    await user.click(screen.getByRole('button', { name: 'Select All' }));
+    await user.click(screen.getByRole('button', { name: 'Download (2)' }));
+
+    const cancelDownloadButton = await screen.findByRole('button', { name: 'Cancel download' });
+    expect(cancelDownloadButton.parentElement?.parentElement).toHaveClass('flex-wrap');
+  });
+
+  it('stops the bulk download loop when the page unmounts mid-download', async () => {
+    // The loop awaits a timer between files, so before the unmount abort it kept
+    // running after teardown and called setState on an unmounted component —
+    // surfacing in CI as "ReferenceError: window is not defined".
+    const user = userEvent.setup();
+    mockApiResponses();
+    const { unmount } = renderMedia();
+
+    await waitFor(() => {
+      expect(screen.getByText('First item')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getAllByRole('button', { name: /^Download$/ })[0]);
+    await user.click(screen.getByRole('menuitem', { name: /Select Items/i }));
+    await user.click(screen.getByRole('button', { name: 'Select All' }));
+    await user.click(screen.getByRole('button', { name: 'Download (2)' }));
+
+    await screen.findByRole('button', { name: 'Cancel download' });
+    const callsBeforeUnmount = vi.mocked(downloadFile).mock.calls.length;
+
+    expect(() => unmount()).not.toThrow();
+
+    // Well past the 200ms inter-file delay: an un-aborted loop would have started
+    // the next download by now.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(vi.mocked(downloadFile).mock.calls.length).toBe(callsBeforeUnmount);
   });
 
   it('clicking a card adds hash to URL', async () => {
@@ -256,6 +335,8 @@ describe('Media page URL state machine', () => {
     await waitFor(() => {
       expect(screen.getByText(/not found/i)).toBeInTheDocument();
     });
+
+    expect(screen.getByText(/not found/i).parentElement).toHaveClass('flex-col', 'sm:flex-row');
   });
 
   it('closing modal removes hash from URL', async () => {
@@ -294,9 +375,9 @@ describe('Media page URL state machine', () => {
       expect(screen.getByText('First item')).toBeInTheDocument();
     });
 
-    // Click the Videos tab
-    const videosTab = screen.getByRole('tab', { name: /Videos/i });
-    await user.click(videosTab);
+    // Click the Videos filter
+    const videosFilter = screen.getByRole('tab', { name: /Videos/i });
+    await user.click(videosFilter);
 
     await waitFor(() => {
       const location = screen.getByTestId('location');

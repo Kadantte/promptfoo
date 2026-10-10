@@ -1,6 +1,7 @@
 import { type TestTimers, useTestTimers } from '@app/tests/timers';
 import { renderWithProviders as baseRender } from '@app/utils/testutils';
-import { type EvaluateTableOutput, ResultFailureReason } from '@promptfoo/types';
+import { type EvaluateTableOutput } from '@promptfoo/types';
+import { ResultFailureReason } from '@promptfoo/types/results';
 import { screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShiftKeyProvider } from '../../../contexts/ShiftKeyContext';
@@ -23,6 +24,7 @@ vi.mock('./store', () => ({
     renderMarkdown: false,
     showPassFail: false,
     showPassReasons: false,
+    showMetricPills: true,
     showPrompts: false,
     maxImageWidth: 256,
     maxImageHeight: 256,

@@ -132,6 +132,7 @@ jobs:
         run: |
           promptfoo scan-model ./models/ \
             --strict \
+            --no-write \
             --format sarif \
             --output model-scan-results.sarif
 
@@ -195,7 +196,7 @@ redteam:
 
   strategies:
     - jailbreak:composite
-    - prompt-injection
+    - jailbreak-templates
 ```
 
 Run the baseline and save results:
@@ -277,7 +278,7 @@ redteam:
 
   strategies:
     - jailbreak:composite
-    - prompt-injection
+    - jailbreak-templates
     - crescendo
 ```
 
@@ -285,7 +286,7 @@ Run acceptance tests before deployment:
 
 ```bash
 promptfoo redteam run -c vendor-acceptance.yaml \
-  --var CANDIDATE_MODEL=anthropic:claude-sonnet-4-20250514
+  --var CANDIDATE_MODEL=anthropic:claude-sonnet-5
 ```
 
 ### Comparing Models Side-by-Side
@@ -298,7 +299,7 @@ description: Security comparison - current vs candidate
 targets:
   - id: openai:gpt-4o
     label: current-production
-  - id: anthropic:claude-sonnet-4-20250514
+  - id: anthropic:claude-sonnet-5
     label: candidate
 
 redteam:
@@ -312,7 +313,7 @@ redteam:
 
   strategies:
     - jailbreak:composite
-    - prompt-injection
+    - jailbreak-templates
 ```
 
 The report shows side-by-side vulnerability rates:
@@ -345,7 +346,7 @@ redteam:
 
   strategies:
     - jailbreak:composite
-    - prompt-injection
+    - jailbreak-templates
 ```
 
 A significantly higher failure rate on the fine-tuned model indicates the fine-tuning process degraded safety training.
@@ -366,7 +367,7 @@ redteam:
     - indirect-prompt-injection
 
   strategies:
-    - prompt-injection
+    - jailbreak-templates
 ```
 
 See the [RAG security guide](./rag.md) for comprehensive coverage.
@@ -385,7 +386,7 @@ redteam:
 
   strategies:
     - jailbreak:composite
-    - prompt-injection
+    - jailbreak-templates
 ```
 
 See the [MCP security testing guide](./mcp-security-testing.md) for details.

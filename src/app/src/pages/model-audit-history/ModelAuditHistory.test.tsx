@@ -1,16 +1,16 @@
 import { TooltipProvider } from '@app/components/ui/tooltip';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useModelAuditHistoryStore } from '../model-audit/stores';
+import { useModelAuditConfigStore, useModelAuditHistoryStore } from '../model-audit/stores';
 import ModelAuditHistory from './ModelAuditHistory';
 
 vi.mock('../model-audit/stores');
 
 const mockNavigate = vi.fn();
-vi.mock('react-router-dom', async () => {
-  const actual = await vi.importActual('react-router-dom');
+vi.mock('react-router', async () => {
+  const actual = await vi.importActual('react-router');
   return {
     ...actual,
     useNavigate: () => mockNavigate,
@@ -36,12 +36,12 @@ const createMockScan = (id: string, name: string, hasErrors: boolean = false) =>
 
 describe('ModelAuditHistory', () => {
   const mockUseHistoryStore = vi.mocked(useModelAuditHistoryStore);
+  const mockUseConfigStore = vi.mocked(useModelAuditConfigStore);
   const mockFetchHistoricalScans = vi.fn();
   const mockFetchHistoricalScanRange = vi.fn();
   const mockDeleteHistoricalScan = vi.fn();
-  const mockSetPageSize = vi.fn();
-  const mockSetCurrentPage = vi.fn();
   const mockSetSortModel = vi.fn();
+  const mockStartNewScan = vi.fn();
 
   afterEach(() => {
     vi.resetAllMocks();
@@ -53,24 +53,21 @@ describe('ModelAuditHistory', () => {
     historyError: null,
     totalCount: 0,
     pageSize: 25,
-    currentPage: 0,
     sortModel: [{ field: 'createdAt', sort: 'desc' as const }],
-    searchQuery: '',
     fetchHistoricalScans: mockFetchHistoricalScans,
     fetchHistoricalScanRange: mockFetchHistoricalScanRange,
     fetchScanById: vi.fn(),
     deleteHistoricalScan: mockDeleteHistoricalScan,
-    setPageSize: mockSetPageSize,
-    setCurrentPage: mockSetCurrentPage,
     setSortModel: mockSetSortModel,
-    setSearchQuery: vi.fn(),
-    resetFilters: vi.fn(),
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
     mockFetchHistoricalScanRange.mockResolvedValue({ scans: [], offset: 0, total: 0 });
     mockUseHistoryStore.mockReturnValue(getDefaultHistoryState() as any);
+    mockUseConfigStore.mockImplementation((selector: any) =>
+      selector({ startNewScan: mockStartNewScan }),
+    );
   });
 
   const renderComponent = () => {
@@ -138,6 +135,36 @@ describe('ModelAuditHistory', () => {
     expect(screen.getByText('Scan 2')).toBeInTheDocument();
   });
 
+  it('labels icon-only scan actions', () => {
+    const mockScans = [createMockScan('1', 'Scan 1')];
+
+    mockUseHistoryStore.mockReturnValue({
+      ...getDefaultHistoryState(),
+      historicalScans: mockScans,
+      totalCount: 1,
+    } as any);
+
+    renderComponent();
+
+    expect(screen.getByRole('button', { name: 'Delete Scan 1' })).toBeInTheDocument();
+  });
+
+  it('distinguishes delete actions for unnamed scans', () => {
+    const mockScans = [createMockScan('unnamed-1', '')];
+
+    mockUseHistoryStore.mockReturnValue({
+      ...getDefaultHistoryState(),
+      historicalScans: mockScans,
+      totalCount: 1,
+    } as any);
+
+    renderComponent();
+
+    expect(
+      screen.getByRole('button', { name: 'Delete Unnamed scan unnamed-1' }),
+    ).toBeInTheDocument();
+  });
+
   it('should not render stale scans when the API reports zero total scans', () => {
     const staleScans = [createMockScan('stale', 'Stale Scan')];
 
@@ -163,6 +190,17 @@ describe('ModelAuditHistory', () => {
       // Verify at least one is inside a clickable element
       expect(newScanButtons[0].closest('button, a')).not.toBeNull();
     });
+  });
+
+  it('should reset the draft before navigating to a new scan', async () => {
+    const user = userEvent.setup();
+
+    renderComponent();
+
+    await user.click(screen.getAllByText('New Scan')[0]);
+
+    expect(mockStartNewScan).toHaveBeenCalledTimes(1);
+    expect(mockNavigate).toHaveBeenCalledWith('/model-audit/setup');
   });
 
   it('should navigate to scan details when row is clicked', async () => {
@@ -215,6 +253,31 @@ describe('ModelAuditHistory', () => {
     // Should show Clean and Issues Found chips
     expect(screen.getByText('Clean')).toBeInTheDocument();
     expect(screen.getByText('Issues Found')).toBeInTheDocument();
+  });
+
+  it('should show issues found for persisted failed-check-only scans', () => {
+    const failedChecksOnly = {
+      ...createMockScan('failed', 'Failed Checks Only', true),
+      failedChecks: 1,
+      results: {
+        path: '/test',
+        success: true,
+        issues: [],
+        failed_checks: 1,
+        checks: [{ name: 'pickle', status: 'failed', message: 'Check failed' }],
+      },
+    };
+
+    mockUseHistoryStore.mockReturnValue({
+      ...getDefaultHistoryState(),
+      historicalScans: [failedChecksOnly],
+      totalCount: 1,
+    } as any);
+
+    renderComponent();
+
+    expect(screen.getByText('Issues Found')).toBeInTheDocument();
+    expect(screen.queryByText('Clean')).not.toBeInTheDocument();
   });
 
   it('should request server-supported sorts for status and checks columns', async () => {

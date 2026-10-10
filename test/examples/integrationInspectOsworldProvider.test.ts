@@ -9,6 +9,7 @@ import { mockProcessEnv } from '../util/utils';
 describe('integration-inspect-osworld example provider', () => {
   const tempDirs: string[] = [];
   let restoreEnv: (() => void) | undefined;
+  let cachedPythonExecutable: string | undefined;
 
   afterEach(() => {
     restoreEnv?.();
@@ -28,7 +29,38 @@ describe('integration-inspect-osworld example provider', () => {
   }
 
   function pythonExecutable(): string {
-    return process.env.PROMPTFOO_PYTHON || process.env.PYTHON || process.env.PYTHON3 || 'python3';
+    if (cachedPythonExecutable) {
+      return cachedPythonExecutable;
+    }
+
+    const pythonProbe = 'import sys; print(sys.executable)';
+    const candidates = [
+      ...(process.env.PROMPTFOO_PYTHON
+        ? [{ command: process.env.PROMPTFOO_PYTHON, args: ['-c', pythonProbe] }]
+        : []),
+      ...(process.env.PYTHON ? [{ command: process.env.PYTHON, args: ['-c', pythonProbe] }] : []),
+      ...(process.env.PYTHON3 ? [{ command: process.env.PYTHON3, args: ['-c', pythonProbe] }] : []),
+      ...(process.platform === 'win32'
+        ? [
+            { command: 'py', args: ['-3', '-c', pythonProbe] },
+            { command: 'python', args: ['-c', pythonProbe] },
+          ]
+        : [
+            { command: 'python3', args: ['-c', pythonProbe] },
+            { command: 'python', args: ['-c', pythonProbe] },
+          ]),
+    ];
+
+    for (const candidate of candidates) {
+      const result = spawnSync(candidate.command, candidate.args, { encoding: 'utf8' });
+      const executable = result.status === 0 ? result.stdout.trim() : '';
+      if (executable) {
+        cachedPythonExecutable = executable;
+        return executable;
+      }
+    }
+
+    return process.platform === 'win32' ? 'python' : 'python3';
   }
 
   it('generates the Inspect osworld_small sample suite', () => {
@@ -810,6 +842,43 @@ sys.exit(4)
         sample_id: 'unknown sample',
         status: 'error',
       });
+    } finally {
+      await provider.shutdown();
+    }
+  }, 20_000);
+
+  it('explains minimal setup when the Inspect executable is missing', async () => {
+    const tempDir = makeTempDir();
+    const providerDir = path.join(tempDir, 'example');
+    fs.mkdirSync(providerDir, { recursive: true });
+    fs.copyFileSync(
+      path.join(process.cwd(), 'examples', 'integration-inspect-osworld', 'provider.py'),
+      path.join(providerDir, 'provider.py'),
+    );
+
+    const missingInspect = path.join(tempDir, 'missing-inspect');
+    const provider = new PythonProvider('file://provider.py', {
+      config: {
+        basePath: path.relative(process.cwd(), providerDir),
+        inspectCommand: [missingInspect],
+        pythonExecutable: pythonExecutable(),
+        timeout: 10_000,
+        timeoutSeconds: 10,
+      },
+    });
+
+    try {
+      const result = await provider.callApi('ignored', {
+        vars: { sample_id: 'sample-123' },
+      } as any);
+
+      expect(result.error).toContain(`Could not find Inspect CLI command '${missingInspect}'`);
+      const guidance = result.error?.split('Install prerequisites with ')[1];
+      expect(guidance).toContain("python -m pip install 'inspect-evals[osworld]'");
+      expect(guidance).toContain('plus the SDK for your selected model');
+      expect(guidance).toContain('providers[0].config.inspectCommand');
+      expect(guidance).not.toMatch(/openai|anthropic|opentelemetry/i);
+      expect(result.output).toBeUndefined();
     } finally {
       await provider.shutdown();
     }

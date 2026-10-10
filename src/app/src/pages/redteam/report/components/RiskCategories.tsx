@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 
 import { Card, CardContent } from '@app/components/ui/card';
 import {
@@ -60,7 +60,7 @@ interface PluginRowProps {
 }
 
 const PluginRow = ({ test, pluginPassRateThreshold, onPluginClick }: PluginRowProps) => {
-  const passRate = test.numPassed / test.total;
+  const passRate = test.total > 0 ? test.numPassed / test.total : 0;
   const isPassing = passRate >= pluginPassRateThreshold;
 
   const displayName =
@@ -72,6 +72,7 @@ const PluginRow = ({ test, pluginPassRateThreshold, onPluginClick }: PluginRowPr
     <button
       key={test.name}
       type="button"
+      aria-label={`View ${displayName} details, ${test.numPassed} of ${test.total} passed, ${isPassing ? 'passing' : 'failing'}`}
       onClick={(e) => {
         e.stopPropagation();
         onPluginClick(test.name);
@@ -79,6 +80,9 @@ const PluginRow = ({ test, pluginPassRateThreshold, onPluginClick }: PluginRowPr
       className={cn(
         'group flex w-full items-center gap-4 px-4 py-2.5 text-left text-sm transition-all cursor-pointer',
         'hover:bg-accent dark:hover:bg-accent/50',
+        'focus-visible:outline-2 focus-visible:outline-transparent focus-visible:outline-offset-2',
+        'focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
+        'forced-colors:focus-visible:outline-[Highlight]',
       )}
     >
       {/* Spacer to align with category chevron */}
@@ -151,6 +155,7 @@ const RiskCategoryRow = ({
   onToggle,
   onPluginClick,
 }: RiskCategoryRowProps) => {
+  const descriptionId = useId();
   const hasFailed = category.passRate < pluginPassRateThreshold;
 
   return (
@@ -159,9 +164,14 @@ const RiskCategoryRow = ({
       <CollapsibleTrigger asChild>
         <button
           type="button"
+          aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${category.name} category, ${category.totalPasses} of ${category.totalTests} passed, ${hasFailed ? 'failing' : 'passing'}`}
+          aria-describedby={descriptionId}
           className={cn(
-            'flex w-full items-center gap-4 p-4 text-left transition-colors cursor-pointer',
+            'flex w-full items-center gap-2 p-4 text-left transition-colors cursor-pointer sm:gap-4',
             'hover:bg-muted/50',
+            'focus-visible:outline-2 focus-visible:outline-transparent focus-visible:outline-offset-2',
+            'focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
+            'forced-colors:focus-visible:outline-[Highlight]',
             isExpanded && 'bg-muted/30',
           )}
         >
@@ -173,7 +183,12 @@ const RiskCategoryRow = ({
           {/* Category Name & Description */}
           <div className="min-w-0 flex-1">
             <span className="font-semibold">{category.name}</span>
-            <p className="truncate text-sm text-muted-foreground">{category.description}</p>
+            <p
+              id={descriptionId}
+              className="sr-only text-sm text-muted-foreground sm:not-sr-only sm:truncate"
+            >
+              {category.description}
+            </p>
           </div>
 
           {/* Progress Bar */}
@@ -190,7 +205,7 @@ const RiskCategoryRow = ({
           </div>
 
           {/* Stats - fixed width to align with plugin rows */}
-          <div className="w-20 shrink-0 text-right">
+          <div className="w-16 shrink-0 text-right sm:w-20">
             <span
               className={cn('text-sm font-semibold', getPassRateStyles(category.passRate).text)}
             >
@@ -211,13 +226,13 @@ const RiskCategoryRow = ({
           </div>
 
           {/* Spacer for chevron alignment */}
-          <div className="w-4 shrink-0 print:hidden" />
+          <div className="hidden w-4 shrink-0 print:hidden sm:block" />
         </button>
       </CollapsibleTrigger>
 
       {/* Expanded Plugin List */}
       <CollapsibleContent forceMount className={cn('data-[state=closed]:hidden print:!block')}>
-        <div className="border-t border-border bg-muted/20">
+        <div className="divide-y divide-border/60 border-t border-border bg-muted/20">
           {category.testTypes.map((test) => (
             <PluginRow
               key={test.name}
@@ -278,7 +293,7 @@ const RiskCategories = ({
 
       return {
         name: category,
-        description: categoryDescriptions[categoryName as keyof typeof categoryDescriptions],
+        description: categoryDescriptions[categoryName as keyof typeof categoryDescriptions] ?? '',
         totalPasses,
         totalTests,
         testTypes,
@@ -315,7 +330,7 @@ const RiskCategories = ({
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col items-start gap-1 sm:flex-row sm:items-center sm:justify-between">
         <h2 className="text-xl font-semibold">Risk Categories</h2>
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <span className={cn('font-medium', getPassRateStyles(overallPassRate).text)}>

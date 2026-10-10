@@ -139,33 +139,69 @@ prompts:
 - Building new templates designed for object navigation
 - Working with complex nested data structures
 
-## Node.js version mismatch error
+<a id="nodejs-version-mismatch-error"></a>
 
-When running `npx promptfoo@latest`, you might encounter this error:
+## libsql binding not found
+
+You may see this error if the libsql platform binding for your OS/architecture is
+missing or wasn't installed:
 
 ```text
-Error: The module '/path/to/node_modules/better-sqlite3/build/Release/better_sqlite3.node'
-was compiled against a different Node.js version using
-NODE_MODULE_VERSION 115. This version of Node.js requires
-NODE_MODULE_VERSION 127. Please try re-compiling or re-installing
-the module (for instance, using `npm rebuild` or `npm install`).
+Error: Cannot find module '@libsql/darwin-arm64'
+Require stack:
+- /path/to/node_modules/libsql/index.js
 ```
 
-This happens because promptfoo uses native code modules (like better-sqlite3) that need to be compiled specifically for your Node.js version.
+libsql ships prebuilt N-API bindings as optional peer packages
+(`@libsql/darwin-arm64`, `@libsql/linux-x64-gnu`, `@libsql/win32-x64-msvc`, etc.).
+N-API is ABI-stable across Node.js versions, so this is almost always a packaging
+issue (npm skipped optional deps, the cache is corrupt, or the platform isn't yet
+supported), not a Node.js version mismatch.
 
-### Solution: Remove npx cache and reinstall
+Use the repair path that matches how you run promptfoo.
 
-To fix this issue, run this single command:
+**Project checkout**
 
 ```bash
-rm -rf ~/.npm/_npx && npx -y promptfoo@latest
+npm install
 ```
 
-This removes any cached npm packages in the npx cache directory and forces a fresh download and installation of promptfoo, ensuring the native modules are compiled correctly for your current Node.js version.
+If `npm install` keeps skipping the binding, force optional dependencies on:
+
+```bash
+npm install --include=optional
+```
+
+**Global npm install**
+
+```bash
+npm install -g promptfoo@latest
+```
+
+**npx**
+
+Remove the cached npx install, then re-run. With newer npm versions, drop only the
+matching cache entry:
+
+```bash
+npm cache npx ls
+npm cache npx rm <key>
+npx -y promptfoo@latest
+```
+
+Use the key shown next to `promptfoo@latest` in `npm cache npx ls`.
+
+**Unsupported platform**
+
+If your `<platform>-<arch>` is not listed in the
+[libsql release matrix](https://github.com/tursodatabase/libsql-js/releases),
+file an issue at
+[promptfoo/promptfoo](https://github.com/promptfoo/promptfoo/issues) with your
+platform and architecture in the title.
 
 ## Native build failures
 
-Some dependencies like [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) include native code that must compile locally. Ensure your machine has a C/C++ build toolchain:
+Some dependencies include native code that may need to compile locally. Ensure your machine has a C/C++ build toolchain:
 
 - **Ubuntu/Debian**: `sudo apt-get install build-essential`
 - **macOS**: `xcode-select --install`
@@ -216,7 +252,7 @@ See the [FAQ](/docs/faq/#how-do-i-configure-promptfoo-for-corporate-networks-or-
 
 If you're using OpenAI, set the `OPENAI_API_KEY` environment variable or add `apiKey` to the provider config.
 
-For default text-only model grading and synthesis, you can also install `@openai/codex-sdk`, sign in through the Codex CLI, and let Promptfoo use `openai:codex-sdk` automatically when no higher-priority API credentials are set. This does not cover embedding or moderation providers.
+For default text-only model grading and synthesis, you can also install the [supported Codex SDK](/docs/providers/openai-codex-sdk/#installation), sign in through the Codex CLI, and let Promptfoo use `openai:codex-sdk` automatically when no higher-priority API credentials are set. This does not cover embedding or moderation providers.
 
 If you're not using OpenAI but still receiving this message, you probably have some [model-graded metric](/docs/configuration/expected-outputs/model-graded/) such as `similar` or `moderation` that requires you to [override the grader](/docs/configuration/expected-outputs/model-graded/#overriding-the-llm-grader) or configure an embedding/moderation provider explicitly.
 
@@ -406,8 +442,8 @@ providers:
 
 On Windows, promptfoo tries to detect Python in this order:
 
-1. `PROMPTFOO_PYTHON` environment variable (if set)
-2. Provider-specific `pythonExecutable` config (if set)
+1. Provider-specific `pythonExecutable` config (if set)
+2. `PROMPTFOO_PYTHON` environment variable (if set)
 3. **Windows smart detection**: Uses `where python` command and filters out Microsoft Store stubs
 4. `python -c "import sys; print(sys.executable)"` (to get the actual Python path)
 5. Common fallback commands: `python`, `python3`, `py -3`, `py`

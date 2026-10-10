@@ -14,13 +14,15 @@ The built-in [`openai:agents:*` provider](/docs/providers/openai-agents) is for 
 
 ## Quick Start
 
+The example uses OpenAI Agents SDK 0.22.x and requires Python 3.10 or later. The sandbox and skill scenarios run local shell commands and require macOS/Linux or WSL.
+
 ```bash
 npx promptfoo@latest init --example openai-agents
 cd openai-agents
 
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 export OPENAI_API_KEY=your_api_key_here
 
@@ -28,6 +30,7 @@ export OPENAI_API_KEY=your_api_key_here
 npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache
 
 # Optional: also emit a provider-level Python OpenTelemetry span
+python -m pip install "opentelemetry-api>=1.44,<2" "opentelemetry-sdk>=1.44,<2" "opentelemetry-exporter-otlp-proto-http>=1.44,<2"
 PROMPTFOO_ENABLE_OTEL=true npx promptfoo@latest eval -c promptfooconfig.yaml --no-cache
 npx promptfoo@latest view
 ```
@@ -35,7 +38,8 @@ npx promptfoo@latest view
 ## What The Example Covers
 
 - multi-turn execution over a persistent `SQLiteSession`
-- SDK 0.14 `SandboxAgent` execution over a staged Unix-local Python workspace
+- SDK `SandboxAgent` execution over a staged Unix-local Python workspace
+- local-shell skill mounting with `ShellTool(environment={"type": "local", "skills": [...]})`
 - specialist handoffs between a triage agent, an FAQ agent, and a seat-booking agent
 - Promptfoo trace ingestion of the SDK's internal spans
 - assertions on tool usage, tool arguments, sandbox commands, agent spans, tool order, and overall task success
@@ -55,7 +59,7 @@ If you skip this exporter, Promptfoo will not see the SDK's tool and handoff spa
 
 If you also enable Promptfoo's Python OpenTelemetry wrapper instrumentation with `PROMPTFOO_ENABLE_OTEL=true`, the example will emit a provider-level Python span as well. The custom SDK spans will inherit that active OpenTelemetry span as their parent. The example config accepts both OTLP JSON and OTLP/protobuf because the SDK bridge emits JSON while the wrapper exporter uses protobuf by default.
 
-SDK 0.14 adds custom spans for sandbox lifecycle work, and the SandboxAgent's shell tool emits `exec_command` function-tool spans. The example bridge maps SDK custom spans into normal OTLP attributes such as `sandbox.operation`, `command`, and `process.exit.code`, while Promptfoo normalizes OpenAI Agents `exec_command` tool spans as command trajectory steps. The same mapping also exposes command spans emitted by the SDK's experimental Codex tool as `command` and `codex.command`.
+The SDK emits custom spans for sandbox lifecycle work, and the SandboxAgent's shell tool emits `exec_command` function-tool spans. The example bridge maps SDK custom spans into normal OTLP attributes such as `sandbox.operation`, `command`, and `process.exit.code`, while Promptfoo normalizes OpenAI Agents `exec_command` tool spans as command trajectory steps. The same mapping also exposes command spans emitted by the SDK's experimental Codex tool as `command` and `codex.command`.
 
 ## Assertion Pattern
 
@@ -109,12 +113,16 @@ Use `trajectory:goal-success` when you want a judge model to decide whether the 
 
 The example turns one eval row into a long-horizon task by passing a JSON-encoded list of user turns in `vars.steps_json`. The provider parses that JSON and executes the turns sequentially against a shared `SQLiteSession`, which lets the SDK preserve working memory across turns inside a single Promptfoo test case.
 
+The example also returns `tokenUsage.numRequests`, cached-input tokens, and reasoning-token detail from the SDK's raw model responses. That preserves the real multi-call footprint of handoffs and tool/model loops instead of collapsing every eval row to one request.
+
 That pattern is useful when you want to evaluate:
 
 - multi-step workflows that need memory
 - agent handoffs over time
 - task completion after several intermediate actions
 - regressions in tool usage across longer trajectories
+
+Promptfoo does not infer a dollar `cost` for this path automatically. A Python provider can mix models, hosted tools, and custom backends inside one agent graph, while the SDK's aggregate usage objects do not identify the priced model for each request. Return `cost` from your provider only when you can account for every billed model and hosted tool used by the run.
 
 ## Sandbox Agents
 
@@ -175,6 +183,60 @@ assert:
 
 Use `UnixLocalSandboxClient` for local development, `DockerSandboxClient` when you need container isolation, and hosted sandbox clients when your application already depends on managed execution. Keep credentials and secrets out of staged `Manifest` files unless the sandbox backend and trace redaction policy are appropriate for that data.
 
+## Skills
+
+The Python SDK exposes Agent Skills through shell environments rather than through Codex-style ambient discovery. For a local, reproducible eval, mount the skill on `ShellTool` explicitly. The bundled example also defines a small `SkillShellExecutor` that runs those local shell commands:
+
+```python
+from pathlib import Path
+
+from agents import Agent, ShellTool
+
+discount_review_skill = {
+    "name": "discount-review",
+    "description": "Inspect the discount policy fixture with the bundled checklist.",
+    "path": "/path/to/skills/discount-review",
+}
+
+agent = Agent(
+    name="Local Skill Analyst",
+    instructions="Use the discount-review skill for discount-policy review tasks.",
+    tools=[
+        ShellTool(
+            environment={
+                "type": "local",
+                "skills": [discount_review_skill],
+            },
+            executor=SkillShellExecutor(cwd=Path(__file__).parent),
+        )
+    ],
+)
+```
+
+The bundled `skill-workflow` example keeps the task small on purpose: it mounts a `discount-review` skill, asks the agent to inspect a local fixture repo, and has the skill run a helper script before answering.
+
+```yaml
+assert:
+  - type: trajectory:step-count
+    value:
+      type: command
+      pattern: '*discount-review/SKILL.md*'
+      min: 1
+  - type: trajectory:step-count
+    value:
+      type: command
+      pattern: '*analyze_discount_policy.py*'
+      min: 1
+  - type: contains
+    value: return discount_percent >= 20
+  - type: not-contains
+    value: 'stderr:'
+```
+
+Today, the Python SDK does not expose a first-class skill invocation event that Promptfoo can normalize into `skill-used`. For Python SDK skill evals, assert on the observable workflow instead: the skill file was read, the helper command ran cleanly, and the final answer reflects the skill's result. If your application already tracks selected skills, you can also return `metadata.skillCalls` from the Python provider yourself and use Promptfoo's [`skill-used`](/docs/configuration/expected-outputs/deterministic/#skill-used) assertion on top of that.
+
+Hosted shell follows the same eval idea, but the attachment shape changes from a local path to a hosted `skill_reference`. Keep local shell for examples you want users to run from a fresh clone; use hosted shell when your product already depends on uploaded, versioned skills.
+
 ## Experimental Codex Tool
 
 The Python SDK's Codex integration is available as `codex_tool` from `agents.extensions.experimental.codex`. It lets a regular Python SDK agent delegate a bounded workspace task to Codex during a tool call:
@@ -204,7 +266,7 @@ agent = Agent(
 
 Evaluate that agent through the same Python provider pattern. The example tracing bridge exposes Codex command execution spans as `command` and `codex.command`, so Promptfoo's trajectory assertions can verify that Codex actually inspected files or ran commands.
 
-If Codex itself is the system under test, prefer Promptfoo's dedicated [`openai:codex-sdk`](/docs/providers/openai-codex-sdk) or [`openai:codex-app-server`](/docs/providers/openai-codex-app-server) providers. The app-server provider supports `approvals_reviewer: guardian_subagent`; the Python `openai-agents` SDK 0.14.1 package does not expose a public `Guardian`/`guardian` API.
+If Codex itself is the system under test, prefer Promptfoo's dedicated [`openai:codex-sdk`](/docs/providers/openai-codex-sdk) or [`openai:codex-app-server`](/docs/providers/openai-codex-app-server) providers. The app-server provider supports `approvals_reviewer: auto_review` (`guardian_subagent` remains a legacy alias); the Python `openai-agents` SDK 0.22.3 package does not expose a public automatic-review API.
 
 ## Red Team The Agent
 

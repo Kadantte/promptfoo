@@ -4,6 +4,7 @@ import { Badge } from '@app/components/ui/badge';
 import { Card, CardContent } from '@app/components/ui/card';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@app/components/ui/tooltip';
 import { cn } from '@app/lib/utils';
+import { calculateAttackSuccessRate } from '@promptfoo/presentation/redteamMetrics';
 import {
   ALIASED_PLUGIN_MAPPINGS,
   DOD_AI_ETHICS_PRINCIPLE_NAMES,
@@ -14,7 +15,6 @@ import {
   Severity,
   severityDisplayNames,
 } from '@promptfoo/redteam/constants';
-import { calculateAttackSuccessRate } from '@promptfoo/redteam/metrics';
 import { CheckCircle, Info } from 'lucide-react';
 import { compareByASRDescending } from '../utils/utils';
 import {
@@ -301,7 +301,7 @@ const FrameworkCard = ({
                     <div key={categoryId} className="overflow-hidden rounded border border-border">
                       <div
                         className={cn(
-                          'flex items-center justify-between bg-black/5 p-2 dark:bg-white/5',
+                          'flex flex-col items-start gap-2 bg-black/5 p-2 dark:bg-white/5 sm:flex-row sm:items-center sm:justify-between',
                           showHeaderBorder && 'border-b border-border',
                         )}
                       >

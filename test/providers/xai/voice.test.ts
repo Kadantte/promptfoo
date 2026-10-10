@@ -1,17 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import WebSocket from 'ws';
 import {
-  calculateXAIVoiceCost,
   createXAIVoiceProvider,
-  XAI_VOICE_COST_PER_MINUTE,
   XAI_VOICE_DEFAULT_API_URL,
+  XAI_VOICE_DEFAULT_MODEL,
   XAI_VOICE_DEFAULT_WS_URL,
   XAI_VOICE_DEFAULTS,
+  XAI_VOICES,
   type XAIFunctionCallOutput,
+  type XAIVoiceOptions,
   XAIVoiceProvider,
 } from '../../../src/providers/xai/voice';
 import { mockProcessEnv } from '../../util/utils';
 
 vi.mock('../../../src/logger');
+vi.mock('ws');
 
 describe('XAI Voice Provider', () => {
   const mockApiKey = 'test-api-key';
@@ -37,7 +40,7 @@ describe('XAI Voice Provider', () => {
 
     it('uses default model when none specified via factory', () => {
       const provider = createXAIVoiceProvider('xai:voice:');
-      expect(provider.id()).toBe('xai:voice:grok-3');
+      expect(provider.id()).toBe('xai:voice:grok-voice-think-fast-2.0');
     });
 
     it('parses model name correctly from provider path', () => {
@@ -47,12 +50,12 @@ describe('XAI Voice Provider', () => {
 
     it('stores configuration correctly', () => {
       const config = {
-        voice: 'Rex' as const,
+        voice: 'rex' as const,
         instructions: 'Be helpful',
         websocketTimeout: 60000,
       };
       const provider = new XAIVoiceProvider('grok-3', { config });
-      expect(provider.config.voice).toBe('Rex');
+      expect(provider.config.voice).toBe('rex');
       expect(provider.config.instructions).toBe('Be helpful');
       expect(provider.config.websocketTimeout).toBe(60000);
     });
@@ -76,12 +79,12 @@ describe('XAI Voice Provider', () => {
       expect(XAI_VOICE_DEFAULT_API_URL).toBe('https://api.x.ai/v1');
     });
 
-    it('has correct cost per minute', () => {
-      expect(XAI_VOICE_COST_PER_MINUTE).toBe(0.05);
+    it('has the current default voice model', () => {
+      expect(XAI_VOICE_DEFAULT_MODEL).toBe('grok-voice-think-fast-2.0');
     });
 
     it('has correct default voice', () => {
-      expect(XAI_VOICE_DEFAULTS.voice).toBe('Ara');
+      expect(XAI_VOICE_DEFAULTS.voice).toBe('ara');
     });
 
     it('has correct default sample rate', () => {
@@ -97,39 +100,199 @@ describe('XAI Voice Provider', () => {
     });
   });
 
-  // ============================================================================
-  // Cost calculation
-  // ============================================================================
+  describe('WebSocket requests', () => {
+    let handlers: Record<string, (...args: unknown[]) => unknown>;
+    let restoreEnv: () => void;
+    const send = vi.fn();
+    const close = vi.fn();
 
-  describe('Cost calculation', () => {
-    it('calculates cost correctly for 1 minute', () => {
-      const cost = calculateXAIVoiceCost(60000);
-      expect(cost).toBe(0.05);
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      restoreEnv = mockProcessEnv({ XAI_API_BASE_URL: undefined });
+      handlers = {};
+      send.mockReset();
+      close.mockReset();
+      vi.mocked(WebSocket).mockImplementation(function () {
+        return {
+          on: (event: string, handler: (...args: unknown[]) => unknown) => {
+            handlers[event] = handler;
+          },
+          send,
+          close,
+        } as unknown as WebSocket;
+      });
     });
 
-    it('calculates cost correctly for 2 minutes', () => {
-      const cost = calculateXAIVoiceCost(120000);
-      expect(cost).toBe(0.1);
+    afterEach(() => {
+      restoreEnv();
+      vi.useRealTimers();
     });
 
-    it('calculates cost correctly for 30 seconds', () => {
-      const cost = calculateXAIVoiceCost(30000);
-      expect(cost).toBe(0.025);
+    const receive = async (event: Record<string, unknown>) => {
+      await handlers.message(Buffer.from(JSON.stringify(event)));
+    };
+    const sentEvents = () => send.mock.calls.map(([event]) => JSON.parse(event));
+    const start = async (config: XAIVoiceOptions = {}, model = XAI_VOICE_DEFAULT_MODEL) => {
+      const provider = createXAIVoiceProvider(`xai:voice:${model}`, {
+        config: { apiKey: mockApiKey, ...config },
+      });
+      const response = provider.callApi('Hello');
+      await handlers.open();
+      return { response };
+    };
+
+    it('sends the current default model, session settings, and text input', async () => {
+      const { response } = await start({}, '');
+
+      expect(WebSocket).toHaveBeenCalledWith(
+        'wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-2.0',
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: `Bearer ${mockApiKey}` }),
+        }),
+      );
+      expect(sentEvents()).toEqual([
+        expect.objectContaining({
+          type: 'session.update',
+          session: expect.objectContaining({
+            voice: 'ara',
+            turn_detection: { type: 'server_vad' },
+          }),
+        }),
+        expect.objectContaining({
+          type: 'conversation.item.create',
+          item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello' }] },
+        }),
+        expect.objectContaining({ type: 'response.create' }),
+      ]);
+      await receive({ type: 'response.output_audio_transcript.delta', delta: 'Hello back' });
+      await receive({ type: 'response.done' });
+      expect(await response).toMatchObject({ output: 'Hello back' });
+      expect(close).toHaveBeenCalledOnce();
     });
 
-    it('calculates cost correctly for 0 duration', () => {
-      const cost = calculateXAIVoiceCost(0);
-      expect(cost).toBe(0);
+    it.each(['response.output_audio', 'response.audio'])(
+      'preserves the transcript for %s events',
+      async (eventPrefix) => {
+        const { response } = await start();
+        await receive({
+          type: `${eventPrefix}.delta`,
+          delta: Buffer.alloc(48000).toString('base64'),
+        });
+        await receive({ type: `${eventPrefix}_transcript.delta`, delta: 'Hello ' });
+        await receive({ type: `${eventPrefix}_transcript.delta`, delta: 'back' });
+        await receive({ type: `${eventPrefix}_transcript.done`, transcript: 'Hello back' });
+        await receive({ type: `${eventPrefix}.done` });
+        await receive({ type: 'response.done' });
+
+        expect(await response).toMatchObject({
+          output: 'Hello back',
+          audio: { transcript: 'Hello back', format: 'wav' },
+        });
+      },
+    );
+
+    it.each([
+      ['Rex', 'rex'],
+      ['rex', 'rex'],
+      ['voice_custom_123', 'voice_custom_123'],
+    ])('sends voice %s, reasoning, and manual turn detection', async (voice, expected) => {
+      const { response } = await start({
+        voice,
+        reasoning: { effort: 'high' },
+        turn_detection: null,
+      });
+      expect(sentEvents()[0].session).toMatchObject({
+        voice: expected,
+        reasoning: { effort: 'high' },
+        turn_detection: null,
+      });
+      await receive({ type: 'response.done' });
+      await response;
     });
 
-    it('calculates cost correctly for fractional minutes', () => {
-      const cost = calculateXAIVoiceCost(90000);
-      expect(cost).toBeCloseTo(0.075, 4);
+    it.each([
+      { format: undefined, bytes: 48000 },
+      { format: { type: 'audio/pcm' as const, rate: 16000 as const }, bytes: 32000 },
+      { format: { type: 'audio/pcmu' as const }, bytes: 8000 },
+      { format: { type: 'audio/pcma' as const }, bytes: 8000 },
+    ])('returns $format audio without inferring a complete bill', async ({ format, bytes }) => {
+      const { response } = await start(format ? { audio: { output: { format } } } : {});
+      vi.setSystemTime(20000);
+      for (const type of ['response.output_audio.delta', 'response.audio.delta']) {
+        await receive({ type, delta: Buffer.alloc(bytes / 2).toString('base64') });
+      }
+      await receive({ type: 'response.done' });
+
+      const result = await response;
+      expect(result.cost).toBeUndefined();
+      expect(result.metadata).toMatchObject({ durationMs: 20000, hasAudio: true });
     });
 
-    it('calculates cost correctly for 10 minutes', () => {
-      const cost = calculateXAIVoiceCost(600000);
-      expect(cost).toBe(0.5);
+    it.each([
+      { type: 'audio/pcmu' as const, samples: [-32124, 32124] },
+      { type: 'audio/pcma' as const, samples: [-5504, 5504] },
+    ])('returns playable PCM WAV from $type output', async ({ type, samples }) => {
+      const { response } = await start({ audio: { output: { format: { type } } } });
+      await receive({
+        type: 'response.audio.delta',
+        delta: Buffer.from([0, 128]).toString('base64'),
+      });
+      await receive({ type: 'response.done' });
+
+      const result = await response;
+      expect(result.audio?.format).toBe('wav');
+      const wav = Buffer.from(result.audio!.data!, 'base64');
+      expect(wav.toString('ascii', 0, 4)).toBe('RIFF');
+      expect(wav.readUInt16LE(20)).toBe(1);
+      expect(wav.readUInt32LE(24)).toBe(8000);
+      expect(wav.readUInt16LE(34)).toBe(16);
+      expect(wav.readUInt32LE(40)).toBe(4);
+      expect([wav.readInt16LE(44), wav.readInt16LE(46)]).toEqual(samples);
+    });
+
+    it('keeps legacy cost unknown without billing duration', async () => {
+      const { response } = await start({}, 'grok-voice-think-fast-1.0');
+      vi.setSystemTime(15000);
+      await receive({ type: 'response.done' });
+
+      expect((await response).cost).toBeUndefined();
+    });
+
+    it('sends a tool result and receives the continuation', async () => {
+      const handler = vi.fn().mockResolvedValue('Sunny');
+      const { response } = await start({ functionCallHandler: handler });
+      await receive({
+        type: 'response.function_call_arguments.done',
+        name: 'weather',
+        call_id: 'call-1',
+        arguments: '{"city":"Paris"}',
+      });
+      await receive({ type: 'response.done' });
+      expect(handler).toHaveBeenCalledWith('weather', '{"city":"Paris"}');
+      expect(sentEvents()).toContainEqual(
+        expect.objectContaining({
+          type: 'conversation.item.create',
+          item: { type: 'function_call_output', call_id: 'call-1', output: 'Sunny' },
+        }),
+      );
+      await receive({ type: 'response.output_audio_transcript.delta', delta: 'It is sunny.' });
+      await receive({ type: 'response.done' });
+
+      expect(await response).toMatchObject({
+        output: {
+          text: 'It is sunny.',
+          functionCalls: [{ name: 'weather', arguments: { city: 'Paris' }, result: 'Sunny' }],
+        },
+      });
+    });
+
+    it('returns provider errors without an estimated cost', async () => {
+      const { response } = await start();
+      await receive({ type: 'error', error: { message: 'Unsupported reasoning effort' } });
+
+      expect(await response).toEqual({ error: 'xAI Voice error: Unsupported reasoning effort' });
+      expect(close).toHaveBeenCalledOnce();
     });
   });
 
@@ -170,18 +333,47 @@ describe('XAI Voice Provider', () => {
 
   describe('Configuration options', () => {
     it('accepts all valid voices', () => {
-      const voices = ['Ara', 'Rex', 'Sal', 'Eve', 'Leo'] as const;
+      const voices = ['ara', 'rex', 'sal', 'eve', 'leo'] as const;
       for (const voice of voices) {
         const provider = new XAIVoiceProvider('grok-3', { config: { voice } });
         expect(provider.config.voice).toBe(voice);
       }
     });
 
+    it.each(['a1b2c3d4', 'TenantVoiceA'])(
+      'preserves opaque voice ID %s in session setup',
+      async (voice) => {
+        const provider = new XAIVoiceProvider('grok-voice-think-fast-2.0', { config: { voice } });
+        const setup = await (provider as any).buildSessionConfig();
+        expect(provider.config.voice).toBe(voice);
+        expect(setup.session.voice).toBe(voice);
+      },
+    );
+
+    it('normalizes legacy title-cased voice names', () => {
+      const provider = new XAIVoiceProvider('grok-3', { config: { voice: 'Ara' } });
+
+      expect(XAI_VOICES).toEqual(['Ara', 'Rex', 'Sal', 'Eve', 'Leo']);
+      expect(provider.config.voice).toBe('ara');
+    });
+
     it('accepts turn detection configuration', () => {
       const provider = new XAIVoiceProvider('grok-3', {
-        config: { turn_detection: { type: 'server_vad' } },
+        config: {
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.75,
+            silence_duration_ms: 500,
+            prefix_padding_ms: 250,
+          },
+        },
       });
-      expect(provider.config.turn_detection).toEqual({ type: 'server_vad' });
+      expect(provider.config.turn_detection).toEqual({
+        type: 'server_vad',
+        threshold: 0.75,
+        silence_duration_ms: 500,
+        prefix_padding_ms: 250,
+      });
     });
 
     it('accepts null turn detection for manual mode', () => {
@@ -309,15 +501,15 @@ describe('XAI Voice Provider', () => {
 
     it('uses default model when not specified', () => {
       const provider = createXAIVoiceProvider('xai:voice:');
-      expect(provider.id()).toBe('xai:voice:grok-3');
+      expect(provider.id()).toBe('xai:voice:grok-voice-think-fast-2.0');
     });
 
     it('passes through options correctly', () => {
       const options = {
-        config: { voice: 'Eve' as const, instructions: 'Be friendly' },
+        config: { voice: 'eve' as const, instructions: 'Be friendly' },
       };
       const provider = createXAIVoiceProvider('xai:voice:grok-3', options);
-      expect((provider as XAIVoiceProvider).config.voice).toBe('Eve');
+      expect((provider as XAIVoiceProvider).config.voice).toBe('eve');
       expect((provider as XAIVoiceProvider).config.instructions).toBe('Be friendly');
     });
 
@@ -388,7 +580,7 @@ describe('XAI Voice Provider', () => {
     it('uses default URL when no custom URL is provided', () => {
       const provider = new TestableXAIVoiceProvider('grok-3');
       expect(provider.getApiUrl()).toBe('https://api.x.ai/v1');
-      expect(provider.getWebSocketUrl()).toBe('wss://api.x.ai/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://api.x.ai/v1/realtime?model=grok-3');
     });
 
     it('uses apiBaseUrl when provided', () => {
@@ -396,7 +588,15 @@ describe('XAI Voice Provider', () => {
         config: { apiBaseUrl: 'https://my-proxy.com/v1' },
       });
       expect(provider.getApiUrl()).toBe('https://my-proxy.com/v1');
-      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime?model=grok-3');
+    });
+
+    it('uses a regional API URL when configured', () => {
+      const provider = new TestableXAIVoiceProvider('grok-3', {
+        config: { region: 'us-east-1' },
+      });
+      expect(provider.getApiUrl()).toBe('https://us-east-1.api.x.ai/v1');
+      expect(provider.getWebSocketUrl()).toBe('wss://us-east-1.api.x.ai/v1/realtime?model=grok-3');
     });
 
     it('uses apiHost when provided', () => {
@@ -404,7 +604,7 @@ describe('XAI Voice Provider', () => {
         config: { apiHost: 'my-proxy.com' },
       });
       expect(provider.getApiUrl()).toBe('https://my-proxy.com/v1');
-      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime?model=grok-3');
     });
 
     it('apiHost takes priority over apiBaseUrl', () => {
@@ -421,35 +621,35 @@ describe('XAI Voice Provider', () => {
       const provider = new TestableXAIVoiceProvider('grok-3', {
         config: { apiBaseUrl: 'https://secure.example.com/v1' },
       });
-      expect(provider.getWebSocketUrl()).toBe('wss://secure.example.com/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://secure.example.com/v1/realtime?model=grok-3');
     });
 
     it('converts http to ws', () => {
       const provider = new TestableXAIVoiceProvider('grok-3', {
         config: { apiBaseUrl: 'http://localhost:8080/v1' },
       });
-      expect(provider.getWebSocketUrl()).toBe('ws://localhost:8080/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('ws://localhost:8080/v1/realtime?model=grok-3');
     });
 
     it('strips trailing slashes from URL', () => {
       const provider = new TestableXAIVoiceProvider('grok-3', {
         config: { apiBaseUrl: 'https://my-proxy.com/v1/' },
       });
-      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime?model=grok-3');
     });
 
     it('strips multiple trailing slashes from URL', () => {
       const provider = new TestableXAIVoiceProvider('grok-3', {
         config: { apiBaseUrl: 'https://my-proxy.com/v1///' },
       });
-      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://my-proxy.com/v1/realtime?model=grok-3');
     });
 
     it('uses XAI_API_BASE_URL environment variable', () => {
       mockProcessEnv({ XAI_API_BASE_URL: 'https://env-proxy.com/v1' });
       const provider = new TestableXAIVoiceProvider('grok-3');
       expect(provider.getApiUrl()).toBe('https://env-proxy.com/v1');
-      expect(provider.getWebSocketUrl()).toBe('wss://env-proxy.com/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://env-proxy.com/v1/realtime?model=grok-3');
     });
 
     it('config apiBaseUrl takes priority over environment variable', () => {
@@ -465,7 +665,7 @@ describe('XAI Voice Provider', () => {
         env: { XAI_API_BASE_URL: 'https://override-proxy.com/v1' },
       });
       expect(provider.getApiUrl()).toBe('https://override-proxy.com/v1');
-      expect(provider.getWebSocketUrl()).toBe('wss://override-proxy.com/v1/realtime');
+      expect(provider.getWebSocketUrl()).toBe('wss://override-proxy.com/v1/realtime?model=grok-3');
     });
 
     it('env overrides take priority over environment variable', () => {
@@ -476,15 +676,17 @@ describe('XAI Voice Provider', () => {
       expect(provider.getApiUrl()).toBe('https://override-proxy.com/v1');
     });
 
-    it('accepts apiBaseUrl and apiHost in config', () => {
+    it('accepts apiBaseUrl, apiHost, and region in config', () => {
       const provider = new XAIVoiceProvider('grok-3', {
         config: {
           apiBaseUrl: 'https://custom.example.com/v1',
           apiHost: 'host.example.com',
+          region: 'us-east-1',
         },
       });
       expect(provider.config.apiBaseUrl).toBe('https://custom.example.com/v1');
       expect(provider.config.apiHost).toBe('host.example.com');
+      expect(provider.config.region).toBe('us-east-1');
     });
 
     it('uses websocketUrl exactly as provided', () => {
@@ -527,6 +729,7 @@ describe('XAI Voice Provider', () => {
       const provider = new TestableXAIVoiceProvider('grok-3', {
         config: { websocketUrl: 'ws://localhost:3000/realtime' },
       });
+      // websocketUrl is used exactly as provided, with no model suffix added.
       expect(provider.getWebSocketUrl()).toBe('ws://localhost:3000/realtime');
     });
 

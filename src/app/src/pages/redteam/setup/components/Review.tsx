@@ -24,33 +24,35 @@ import { Spinner } from '@app/components/ui/spinner';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@app/components/ui/tooltip';
 import { EVAL_ROUTES, REDTEAM_ROUTES } from '@app/constants/routes';
 import { useApiHealth } from '@app/hooks/useApiHealth';
-import { useEmailVerification } from '@app/hooks/useEmailVerification';
-import { useEvalHistoryRefresh } from '@app/hooks/useEvalHistoryRefresh';
 import { useTelemetry } from '@app/hooks/useTelemetry';
 import { useToast } from '@app/hooks/useToast';
 import { cn } from '@app/lib/utils';
 import YamlEditor from '@app/pages/eval-creator/components/YamlEditor';
 import { useRedteamJobStore } from '@app/stores/redteamJobStore';
 import { callApi } from '@app/utils/api';
+import { checkEmailStatus } from '@app/utils/emailVerification';
 import { isFoundationModelProvider } from '@promptfoo/providers/constants';
 import { REDTEAM_DEFAULTS, strategyDisplayNames } from '@promptfoo/redteam/constants';
 import {
   isValidPolicyObject,
   makeDefaultPolicyName,
 } from '@promptfoo/redteam/plugins/policy/utils';
-import { getUnifiedConfig } from '@promptfoo/redteam/sharedFrontend';
+import isEqual from 'fast-deep-equal';
 import { BarChart2, ChevronDown, Eye, Info, Play, Save, Search, Sliders, X } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { useRedTeamConfig } from '../hooks/useRedTeamConfig';
-import { generateOrderedYaml } from '../utils/yamlHelpers';
+import { useRedTeamTargetConfigValidation } from '../hooks/useRedTeamTargetConfigValidation';
+import { generateOrderedYaml, getRuntimeRedteamConfig } from '../utils/yamlHelpers';
 import DefaultTestVariables from './DefaultTestVariables';
 import { EmailVerificationDialog } from './EmailVerificationDialog';
 import EstimationsDisplay from './EstimationsDisplay';
 import { LogViewer } from './LogViewer';
 import PageWrapper from './PageWrapper';
 import { RunOptionsContent } from './RunOptions';
-import type { Policy, PolicyObject, RedteamPlugin } from '@promptfoo/redteam/types';
+import type { PluginConfig, Policy, PolicyObject, RedteamPlugin } from '@promptfoo/redteam/types';
 import type { Job, RedteamRunOptions } from '@promptfoo/types';
+
+import type { ProviderOptions } from '../types';
 
 interface ReviewProps {
   onBack?: () => void;
@@ -69,6 +71,90 @@ interface JobStatusResponse {
   jobId?: string;
 }
 
+const getRunTargetValidationError = (
+  targetConfigError: string | null,
+  confirmedTarget: ProviderOptions,
+  latestTarget: ProviderOptions,
+): string | null => {
+  if (targetConfigError) {
+    return targetConfigError;
+  }
+  return isEqual(confirmedTarget, latestTarget)
+    ? null
+    : 'Target configuration changed while preparing the run. Review and try again.';
+};
+
+interface IntentEntry {
+  display: string;
+  isMultiStep: boolean;
+  // Position of the intent plugin in `config.plugins`. Configs may contain
+  // multiple intent plugins, so we identify which one this entry came from.
+  pluginIndex: number;
+  // Position of the entry within that plugin's `config.intent` array.
+  entryIndex: number;
+}
+
+interface IntentPluginRef {
+  id: 'intent';
+  config: { intent: string | (string | string[])[] };
+}
+
+const isIntentPlugin = (plugin: unknown): plugin is IntentPluginRef =>
+  typeof plugin === 'object' &&
+  plugin !== null &&
+  (plugin as { id?: unknown }).id === 'intent' &&
+  (plugin as { config?: { intent?: unknown } }).config?.intent !== undefined;
+
+const isNonEmptyIntentEntry = (entry: string | string[]): boolean =>
+  typeof entry === 'string' ? entry.trim() !== '' : Array.isArray(entry) && entry.length > 0;
+
+type ReviewPlugin = RedteamPlugin | { id: string; config?: PluginConfig };
+
+// Aggregates entries across every intent plugin in the config. Each top-level
+// entry in `config.intent` is one intent test case at runtime (an inner array
+// is a single multi-step sequence). Tracks (pluginIndex, entryIndex) so the
+// remove handler can target the exact entry, even when multiple intent plugins
+// exist (e.g. configs assembled from YAML that include duplicate `intent:`
+// blocks).
+function getDisplayedIntents(plugins: readonly ReviewPlugin[]): IntentEntry[] {
+  return plugins.flatMap<IntentEntry>((plugin, pluginIndex) => {
+    if (!isIntentPlugin(plugin)) {
+      return [];
+    }
+    const raw = plugin.config.intent;
+    const entries: (string | string[])[] = Array.isArray(raw) ? raw : [raw];
+    return entries.flatMap<IntentEntry>((entry, entryIndex) => {
+      if (!isNonEmptyIntentEntry(entry)) {
+        return [];
+      }
+      if (Array.isArray(entry)) {
+        return [{ display: entry.join(' → '), isMultiStep: true, pluginIndex, entryIndex }];
+      }
+      return [{ display: entry, isMultiStep: false, pluginIndex, entryIndex }];
+    });
+  });
+}
+
+function removeIntentEntry(
+  plugins: readonly ReviewPlugin[],
+  pluginIndex: number,
+  entryIndex: number,
+): ReviewPlugin[] | null {
+  const target = plugins[pluginIndex];
+  if (!target || !isIntentPlugin(target)) {
+    return null;
+  }
+  const currentIntents: (string | string[])[] = Array.isArray(target.config.intent)
+    ? target.config.intent
+    : [target.config.intent];
+  const newIntents = currentIntents.filter((_, i) => i !== entryIndex);
+  return plugins.map((p, i) =>
+    i === pluginIndex && isIntentPlugin(p)
+      ? { ...p, config: { ...p.config, intent: newIntents } }
+      : p,
+  );
+}
+
 export default function Review({
   onBack,
   navigateToPlugins,
@@ -76,13 +162,13 @@ export default function Review({
   navigateToPurpose,
 }: ReviewProps) {
   const { config, updateConfig } = useRedTeamConfig();
+  const { targetConfigError } = useRedTeamTargetConfigValidation();
   const { recordEvent } = useTelemetry();
   const {
     data: { status: apiHealthStatus },
     isLoading: isCheckingApiHealth,
   } = useApiHealth();
   const { jobId: savedJobId, setJob, clearJob, _hasHydrated } = useRedteamJobStore();
-  const { signalEvalCompleted } = useEvalHistoryRefresh();
   const pollIntervalRef = useRef<number | null>(null);
   const [isYamlDialogOpen, setIsYamlDialogOpen] = React.useState(false);
   const yamlContent = useMemo(() => generateOrderedYaml(config), [config]);
@@ -97,9 +183,9 @@ export default function Review({
   );
   const [isJobStatusDialogOpen, setIsJobStatusDialogOpen] = useState(false);
   const [isEmailDialogOpen, setIsEmailDialogOpen] = useState(false);
+  const confirmedRunTargetRef = useRef<ProviderOptions | null>(null);
   const [emailVerificationMessage, setEmailVerificationMessage] = useState('');
   const [emailVerificationError, setEmailVerificationError] = useState<string | null>(null);
-  const { checkEmailStatus } = useEmailVerification();
   const [isPurposeExpanded, setIsPurposeExpanded] = useState(false);
   const [isTestInstructionsExpanded, setIsTestInstructionsExpanded] = useState(false);
   const [isRunOptionsExpanded, setIsRunOptionsExpanded] = useState(true);
@@ -264,6 +350,11 @@ export default function Review({
   }, [_hasHydrated]); // Run once after hydration completes
 
   const handleSaveYaml = () => {
+    if (targetConfigError) {
+      showToast(targetConfigError, 'error');
+      return;
+    }
+
     const blob = new Blob([yamlContent], { type: 'text/yaml' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -280,6 +371,11 @@ export default function Review({
   };
 
   const handleOpenYamlDialog = () => {
+    if (targetConfigError) {
+      showToast(targetConfigError, 'error');
+      return;
+    }
+
     setIsYamlDialogOpen(true);
   };
 
@@ -312,16 +408,17 @@ export default function Review({
     );
   }, [config.plugins]);
 
-  const intents = useMemo(() => {
-    return config.plugins
-      .filter(
-        (p): p is { id: 'intent'; config: { intent: string | string[] } } =>
-          typeof p === 'object' && p.id === 'intent' && p.config?.intent !== undefined,
-      )
-      .map((p) => p.config.intent)
-      .flat()
-      .filter((intent): intent is string => typeof intent === 'string' && intent.trim() !== '');
-  }, [config.plugins]);
+  const intents = useMemo(() => getDisplayedIntents(config.plugins), [config.plugins]);
+
+  const handleRemoveIntent = useCallback(
+    (pluginIndex: number, entryIndex: number) => {
+      const next = removeIntentEntry(config.plugins, pluginIndex, entryIndex);
+      if (next) {
+        updateConfig('plugins', next);
+      }
+    },
+    [config.plugins, updateConfig],
+  );
 
   const [expanded, setExpanded] = React.useState(false);
 
@@ -349,12 +446,20 @@ export default function Review({
   }, [config.strategies]);
 
   const isRunNowDisabled = useMemo(() => {
-    return isRunning || ['blocked', 'disabled', 'unknown'].includes(apiHealthStatus);
-  }, [isRunning, apiHealthStatus]);
+    return (
+      isRunning ||
+      Boolean(targetConfigError) ||
+      ['blocked', 'disabled', 'unknown'].includes(apiHealthStatus)
+    );
+  }, [isRunning, apiHealthStatus, targetConfigError]);
 
   const runNowTooltipMessage = useMemo((): string | undefined => {
     if (isRunning) {
       return undefined;
+    }
+
+    if (targetConfigError) {
+      return targetConfigError;
     }
 
     switch (apiHealthStatus) {
@@ -367,7 +472,7 @@ export default function Review({
       default:
         return undefined;
     }
-  }, [isRunning, apiHealthStatus]);
+  }, [isRunning, apiHealthStatus, targetConfigError]);
 
   const checkForRunningJob = async (): Promise<JobStatusResponse> => {
     try {
@@ -415,8 +520,6 @@ export default function Review({
 
             if (status.status === 'complete' && status.result && status.evalId) {
               setEvalId(status.evalId);
-              signalEvalCompleted();
-
               recordEvent('funnel', {
                 type: 'redteam',
                 step: 'webui_evaluation_completed',
@@ -443,10 +546,19 @@ export default function Review({
 
       pollIntervalRef.current = interval;
     },
-    [clearJob, recordEvent, showToast, signalEvalCompleted],
+    [clearJob, recordEvent, showToast],
   );
 
   const handleRunWithSettings = async () => {
+    if (targetConfigError) {
+      confirmedRunTargetRef.current = null;
+      showToast(targetConfigError, 'error');
+      return;
+    }
+    const confirmedTarget =
+      confirmedRunTargetRef.current ?? structuredClone(useRedTeamConfig.getState().config.target);
+    confirmedRunTargetRef.current = confirmedTarget;
+
     // Check email verification first
     const emailResult = await checkEmailStatus();
 
@@ -472,10 +584,25 @@ export default function Review({
 
     const { hasRunningJob } = await checkForRunningJob();
 
+    const { config: latestConfig } = useRedTeamConfig.getState();
+    const { targetConfigError: latestTargetConfigError } =
+      useRedTeamTargetConfigValidation.getState();
+    const runTargetValidationError = getRunTargetValidationError(
+      latestTargetConfigError,
+      confirmedTarget,
+      latestConfig.target,
+    );
+    if (runTargetValidationError) {
+      confirmedRunTargetRef.current = null;
+      showToast(runTargetValidationError, 'error');
+      return;
+    }
+
     if (hasRunningJob) {
       setIsJobStatusDialogOpen(true);
       return;
     }
+    confirmedRunTargetRef.current = null;
 
     // Clear any existing polling interval before starting a new job
     if (pollIntervalRef.current) {
@@ -485,12 +612,15 @@ export default function Review({
 
     recordEvent('feature_used', {
       feature: 'redteam_config_run',
-      numPlugins: config.plugins.length,
-      numStrategies: config.strategies.length,
-      targetType: config.target.id,
+      numPlugins: latestConfig.plugins.length,
+      numStrategies: latestConfig.strategies.length,
+      targetType: latestConfig.target.id,
     });
 
-    if (config.target.id === 'http' && config.target.config.url?.includes('promptfoo.app')) {
+    if (
+      latestConfig.target.id === 'http' &&
+      latestConfig.target.config?.url?.includes('promptfoo.app')
+    ) {
       // Track report export
       recordEvent('webui_action', {
         action: 'redteam_run_with_example',
@@ -501,9 +631,9 @@ export default function Review({
       type: 'redteam',
       step: 'webui_evaluation_started',
       source: 'webui',
-      numPlugins: config.plugins.length,
-      numStrategies: config.strategies.length,
-      targetType: config.target.id,
+      numPlugins: latestConfig.plugins.length,
+      numStrategies: latestConfig.strategies.length,
+      targetType: latestConfig.target.id,
     });
 
     setIsRunning(true);
@@ -517,11 +647,11 @@ export default function Review({
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          config: getUnifiedConfig(config),
+          config: getRuntimeRedteamConfig(latestConfig),
           force: forceRegeneration,
-          verbose: config.target.config.verbose,
+          verbose: latestConfig.target.config?.verbose,
           maxConcurrency,
-          delay: config.target.config.delay,
+          delay: latestConfig.target.config?.delay,
         }),
       });
 
@@ -618,6 +748,7 @@ export default function Review({
                     {count > 1 ? `${label} (${count})` : label}
                     <button
                       type="button"
+                      aria-label={`Remove plugin ${label}`}
                       onClick={() => {
                         const newPlugins = config.plugins.filter((plugin) => {
                           const pluginLabel = getPluginSummary(plugin).label;
@@ -662,6 +793,7 @@ export default function Review({
                     {count > 1 ? `${label} (${count})` : label}
                     <button
                       type="button"
+                      aria-label={`Remove strategy ${label}`}
                       onClick={() => {
                         const strategyId =
                           Object.entries(strategyDisplayNames).find(
@@ -749,6 +881,11 @@ export default function Review({
                         <Button
                           variant="ghost"
                           size="icon"
+                          aria-label={`Remove policy ${
+                            isPolicyObject
+                              ? (policy.config.policy as PolicyObject).name
+                              : makeDefaultPolicyName(index)
+                          }`}
                           className="size-6 shrink-0"
                           onClick={() => {
                             const policyToMatch =
@@ -788,42 +925,35 @@ export default function Review({
               </CardHeader>
               <CardContent>
                 <div className="space-y-2">
-                  {intents.slice(0, expanded ? undefined : 5).map((intent, index) => (
-                    <div key={index} className="relative rounded-lg bg-muted/50 p-3 pr-8">
-                      <p className="line-clamp-2 text-sm">{intent}</p>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="absolute right-1 top-1 size-6"
-                        onClick={() => {
-                          const intentPlugin = config.plugins.find(
-                            (p): p is { id: 'intent'; config: { intent: string | string[] } } =>
-                              typeof p === 'object' &&
-                              p.id === 'intent' &&
-                              p.config?.intent !== undefined,
-                          );
-
-                          if (intentPlugin) {
-                            const currentIntents = Array.isArray(intentPlugin.config.intent)
-                              ? intentPlugin.config.intent
-                              : [intentPlugin.config.intent];
-
-                            const newIntents = currentIntents.filter((i) => i !== intent);
-
-                            const newPlugins = config.plugins.map((p) =>
-                              typeof p === 'object' && p.id === 'intent'
-                                ? { ...p, config: { ...p.config, intent: newIntents } }
-                                : p,
-                            );
-
-                            updateConfig('plugins', newPlugins);
-                          }
-                        }}
-                      >
-                        <X className="size-4" />
-                      </Button>
-                    </div>
-                  ))}
+                  {intents
+                    .slice(0, expanded ? undefined : 5)
+                    .map(({ display, isMultiStep, pluginIndex, entryIndex }) => {
+                      // Truncate long entries for the SR/title label so screen
+                      // readers can distinguish multiple Remove buttons.
+                      const shortLabel = display.length > 80 ? `${display.slice(0, 80)}…` : display;
+                      const key = `${pluginIndex}:${entryIndex}`;
+                      return (
+                        <div key={key} className="relative rounded-lg bg-muted/50 p-3 pr-8">
+                          <p className="line-clamp-2 text-sm" title={display}>
+                            {display}
+                          </p>
+                          {isMultiStep && (
+                            <p className="mt-0.5 text-xs text-muted-foreground">
+                              Multi-step intent
+                            </p>
+                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label={`Remove intent: ${shortLabel}`}
+                            className="absolute right-1 top-1 size-6"
+                            onClick={() => handleRemoveIntent(pluginIndex, entryIndex)}
+                          >
+                            <X className="size-4" />
+                          </Button>
+                        </div>
+                      );
+                    })}
                   {intents.length > 5 && (
                     <Button
                       variant="link"
@@ -844,10 +974,12 @@ export default function Review({
         <div className="mt-6 rounded-lg border border-border shadow-sm">
           {/* Application Details */}
           <Collapsible open={isPurposeExpanded} onOpenChange={setIsPurposeExpanded}>
-            <CollapsibleTrigger className="flex w-full items-center justify-between border-b border-border p-4 hover:bg-muted/50">
-              <div className="flex items-center gap-2">
-                <Info className="size-4 text-muted-foreground" />
-                <h3 className="text-lg font-semibold">Application Details</h3>
+            <CollapsibleTrigger className="flex w-full items-start justify-between gap-3 border-b border-border p-4 hover:bg-muted/50 sm:items-center">
+              <div className="flex min-w-0 flex-1 flex-col items-start gap-2 sm:flex-row sm:items-center">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Info className="size-4 shrink-0 text-muted-foreground" />
+                  <h3 className="min-w-0 text-lg font-semibold">Application Details</h3>
+                </div>
                 {config.purpose && (
                   <Badge
                     variant="outline"
@@ -1005,10 +1137,12 @@ export default function Review({
 
           {/* Advanced Configuration */}
           <Collapsible open={isAdvancedConfigExpanded} onOpenChange={setIsAdvancedConfigExpanded}>
-            <CollapsibleTrigger className="flex w-full items-center justify-between border-b border-border p-4 hover:bg-muted/50">
-              <div className="flex items-center gap-2">
-                <Sliders className="size-4 text-muted-foreground" />
-                <h3 className="text-lg font-semibold">Advanced Configuration</h3>
+            <CollapsibleTrigger className="flex w-full items-start justify-between gap-3 border-b border-border p-4 hover:bg-muted/50 sm:items-center">
+              <div className="flex min-w-0 flex-1 flex-col items-start gap-2 sm:flex-row sm:items-center">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Sliders className="size-4 shrink-0 text-muted-foreground" />
+                  <h3 className="min-w-0 text-lg font-semibold">Advanced Configuration</h3>
+                </div>
                 <Badge variant="outline" className="text-xs">
                   Optional
                 </Badge>
@@ -1052,8 +1186,8 @@ export default function Review({
                   maxCharsPerMessage={config.maxCharsPerMessage}
                   runOptions={{
                     maxConcurrency: config.maxConcurrency,
-                    delay: config.target.config.delay,
-                    verbose: config.target.config.verbose,
+                    delay: config.target.config?.delay,
+                    verbose: config.target.config?.verbose,
                   }}
                   updateConfig={updateConfig}
                   updateRunOption={(
@@ -1096,11 +1230,20 @@ export default function Review({
             </p>
             <Code>promptfoo redteam run</Code>
             <div className="mt-4 flex gap-3">
-              <Button onClick={handleSaveYaml} className="gap-2">
+              <Button
+                onClick={handleSaveYaml}
+                disabled={Boolean(targetConfigError)}
+                className="gap-2"
+              >
                 <Save className="size-4" />
                 Save YAML
               </Button>
-              <Button variant="outline" onClick={handleOpenYamlDialog} className="gap-2">
+              <Button
+                variant="outline"
+                onClick={handleOpenYamlDialog}
+                disabled={Boolean(targetConfigError)}
+                className="gap-2"
+              >
                 <Eye className="size-4" />
                 View YAML
               </Button>
@@ -1134,7 +1277,10 @@ export default function Review({
                   <TooltipTrigger asChild>
                     <span>
                       <Button
-                        onClick={handleRunWithSettings}
+                        onClick={() => {
+                          confirmedRunTargetRef.current = null;
+                          handleRunWithSettings();
+                        }}
                         disabled={isRunNowDisabled}
                         className="gap-2"
                       >
@@ -1186,7 +1332,15 @@ export default function Review({
         </Dialog>
 
         {/* Job Status Dialog */}
-        <Dialog open={isJobStatusDialogOpen} onOpenChange={setIsJobStatusDialogOpen}>
+        <Dialog
+          open={isJobStatusDialogOpen}
+          onOpenChange={(open) => {
+            setIsJobStatusDialogOpen(open);
+            if (!open) {
+              confirmedRunTargetRef.current = null;
+            }
+          }}
+        >
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Job Already Running</DialogTitle>
@@ -1196,7 +1350,13 @@ export default function Review({
               a new one?
             </p>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setIsJobStatusDialogOpen(false)}>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setIsJobStatusDialogOpen(false);
+                  confirmedRunTargetRef.current = null;
+                }}
+              >
                 Cancel
               </Button>
               <Button onClick={handleCancelExistingAndRun}>Cancel Existing & Run New</Button>
@@ -1214,7 +1374,10 @@ export default function Review({
 
         <EmailVerificationDialog
           open={isEmailDialogOpen}
-          onClose={() => setIsEmailDialogOpen(false)}
+          onClose={() => {
+            setIsEmailDialogOpen(false);
+            confirmedRunTargetRef.current = null;
+          }}
           onSuccess={() => {
             setIsEmailDialogOpen(false);
             handleRunWithSettings();

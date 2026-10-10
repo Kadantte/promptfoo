@@ -3,17 +3,21 @@ import dedent from 'dedent';
 import { z } from 'zod';
 import cliState from '../../cliState';
 import { CLOUD_PROVIDER_PREFIX } from '../../constants';
+import { EmailValidationError } from '../../globalConfig/accounts';
 import logger from '../../logger';
 import telemetry from '../../telemetry';
+import { collectKeyValueOption, normalizeTagOption } from '../../util/cliOptions';
 import { getConfigFromCloud } from '../../util/cloud';
+import { ConfigResolutionError, logConfigResolutionError } from '../../util/config/load';
 import { setupEnv } from '../../util/index';
 import { doRedteamRun } from '../shared';
+import { ProbeLimitExceededError, type RedteamRunOptions } from '../types';
 import { poisonCommand } from './poison';
 import type { Command } from 'commander';
 
-import type { RedteamRunOptions } from '../types';
-
 const UUID_REGEX = /^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$/;
+
+type RedteamRunCliOptions = Omit<RedteamRunOptions, 'tags'> & { tag?: Record<string, string> };
 
 export function redteamRunCommand(program: Command) {
   program
@@ -59,7 +63,15 @@ export function redteamRunCommand(program: Command) {
     )
     .option('-t, --target <id>', 'Cloud provider target ID to run the scan on')
     .option('-d, --description <text>', 'Custom description/name for this scan run')
-    .action(async (opts: RedteamRunOptions) => {
+    .option(
+      '--tag <key=value>',
+      'Set an eval tag in key=value format. Can be specified multiple times; CLI tags override config tags.',
+      (value: string, previous: Record<string, string> | undefined) =>
+        collectKeyValueOption('--tag', value, previous),
+    )
+    .action(async (rawOpts: RedteamRunCliOptions) => {
+      const opts: RedteamRunOptions = normalizeTagOption(rawOpts);
+
       setupEnv(opts.envPath);
       telemetry.record('redteam run', {});
 
@@ -102,14 +114,20 @@ export function redteamRunCommand(program: Command) {
         if (opts.maxConcurrency !== undefined) {
           cliState.maxConcurrency = opts.maxConcurrency;
         }
-        await doRedteamRun(opts);
+        await doRedteamRun({ ...opts, eventSource: 'cli' });
       } catch (error) {
         if (error instanceof z.ZodError) {
           logger.error('Invalid options:');
           error.issues.forEach((err: z.ZodIssue) => {
             logger.error(`  ${err.path.join('.')}: ${err.message}`);
           });
-        } else {
+        } else if (error instanceof ConfigResolutionError) {
+          logConfigResolutionError(error);
+        } else if (
+          !(error instanceof EmailValidationError) &&
+          !(error instanceof ProbeLimitExceededError)
+        ) {
+          // These expected failures are already logged by their helpers.
           logger.error(
             `An unexpected error occurred during red team run: ${error instanceof Error ? error.message : String(error)}\n${
               error instanceof Error ? error.stack : ''

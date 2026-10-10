@@ -34,7 +34,7 @@ When the strategy hits a refusal, it backtracks to an earlier point in the conve
 
 ## Use in Promptfoo
 
-Promptfoo supports three types of multi-turn [strategies](/docs/red-team/strategies/):
+Promptfoo supports five types of multi-turn [strategies](/docs/red-team/strategies/):
 
 #### 1. Crescendo
 
@@ -44,11 +44,15 @@ Gradually increases the intensity or harmfulness of the prompt with each turn, s
 
 Hydra coordinates an attacker agent that branches across multiple conversational paths. It remembers every refusal, automatically manages backtracking, and shares successful tactics across the entire scan. Use Hydra when you need the attacker to pivot rapidly and reuse prior learnings.
 
-#### 3. GOAT
+#### 3. Goblin
+
+[Goblin](/docs/red-team/strategies/goblin/) reuses Hydra's adaptive multi-turn mechanics with an attacker prompt inspired by IICL-style abstract few-shot pattern completion and occasional encoding shifts.
+
+#### 4. GOAT
 
 The [GOAT strategy](/docs/red-team/strategies/goat/) is based on [Meta's GOAT research](https://arxiv.org/abs/2311.04300). It stands for Generalized Offensive Adversarial Testing and uses a set of attack templates and iteratively refines them over multiple turns to bypass defenses.
 
-#### 4. Mischievous User
+#### 5. Mischievous User
 
 Simulates a persistent, creative user who tries different phrasings and approaches over several turns to elicit a harmful or policy-violating response from the model.
 
@@ -64,6 +68,7 @@ redteam:
     - crescendo
     - goat
     - jailbreak:hydra
+    - jailbreak:goblin
     - mischievous-user
 ```
 
@@ -81,6 +86,11 @@ redteam:
     - id: jailbreak:hydra
       config:
         maxTurns: 10
+        stateful: false # Replays the full conversation history by default
+    - id: jailbreak:goblin
+      config:
+        maxTurns: 10
+        stateful: false # Replays the full conversation history by default
     - id: goat
       config:
         maxTurns: 5
@@ -97,7 +107,7 @@ Increasing the number of turns (and backtracks for strategies that expose that o
 Since multi-turn strategies are relatively high cost, we recommend running it on a smaller number of tests and plugins, with a cheaper provider, or prefer a simpler [iterative](iterative.md) strategy.
 
 :::info
-If your system maintains a conversation history and only expects the latest message to be sent, set `stateful: true`. [Make sure to configure cookies or sessions in your provider as well.](/docs/providers/http/#server-side-session-management)
+If your system maintains a conversation history and only expects the latest message to be sent, set `stateful: true`. Configure session handling in the provider too: use [HTTP session management](/docs/providers/http/#server-side-session-management) for HTTP targets or [stateful OpenAI Agents sessions](/docs/providers/openai-agents/#stateful-red-team-runs) for the built-in Agents SDK provider.
 :::
 
 ### Continue After Success
@@ -120,8 +130,9 @@ strategies:
 When `continueAfterSuccess: true`:
 
 - The strategy will continue generating attacks even after finding successful ones
-- All successful attacks are recorded in the metadata
+- All successful attacks are recorded in the metadata, and `redteamHistory` keeps the whole conversation
 - The strategy only stops when `maxTurns` is reached
+- The verdict, guardrail checks, and displayed inputs stay with the first flagged turn. Later refusals or guardrail blocks cannot erase it.
 - This can help discover multiple attack vectors or progressively stronger attacks, but it will take longer to complete and cost more.
 
 ### Unblocking Feature

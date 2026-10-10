@@ -1,15 +1,14 @@
 import { useEffect, useState } from 'react';
 
-import { Button } from '@app/components/ui/button';
 import { Input } from '@app/components/ui/input';
 import { Label } from '@app/components/ui/label';
 import { useTelemetry } from '@app/hooks/useTelemetry';
-import { isInputComposing } from '@app/utils/keyboard';
 import { useRedTeamConfig } from '../../hooks/useRedTeamConfig';
+import { useRedTeamTargetConfigValidation } from '../../hooks/useRedTeamTargetConfigValidation';
 import LoadExampleButton from '../LoadExampleButton';
 import PageWrapper from '../PageWrapper';
-import { getProviderType } from './helpers';
 import ProviderTypeSelector from './ProviderTypeSelector';
+import { getProviderEditorType } from './providerCatalog';
 
 import type { ProviderOptions } from '../../types';
 
@@ -20,11 +19,19 @@ interface TargetTypeSelectionProps {
 
 export default function TargetTypeSelection({ onNext, onBack }: TargetTypeSelectionProps) {
   const { config, updateConfig, providerType, setProviderType } = useRedTeamConfig();
+  const { clearTargetConfigValidation, targetConfigRevision } = useRedTeamTargetConfigValidation();
 
-  // Check if we have a complete saved configuration
-  // For custom providers, id is intentionally empty but providerType is set to 'custom'
+  // Keep configured imports even when their optional label is missing. The default HTTP
+  // placeholder has no URL and should still require an explicit target-type selection.
   const hasCompleteSavedConfig = Boolean(
-    config.target?.label?.trim() && (config.target?.id || providerType === 'custom'),
+    (typeof config.target?.label === 'string' &&
+      config.target.label.trim() &&
+      (config.target?.id || providerType === 'custom')) ||
+      (config.target?.id &&
+        (config.target.id !== 'http' ||
+          (typeof config.target.config?.url === 'string' && config.target.config.url.trim()) ||
+          (typeof config.target.config?.request === 'string' &&
+            config.target.config.request.trim()))),
   );
 
   const [selectedTarget, setSelectedTarget] = useState<ProviderOptions>(() => {
@@ -36,17 +43,25 @@ export default function TargetTypeSelection({ onNext, onBack }: TargetTypeSelect
     return { id: '', label: '', config: {} };
   });
 
-  // Only show target type section if we have a complete saved configuration
-  const [showTargetTypeSection, setShowTargetTypeSection] = useState(hasCompleteSavedConfig);
-
   const { recordEvent } = useTelemetry();
+
+  // A full config load can replace the target while this step remains mounted.
+  // Only replacements increment the revision, so incomplete in-progress edits stay local.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: sync only on full config replacement
+  useEffect(() => {
+    if (targetConfigRevision) {
+      setSelectedTarget(config.target ?? { id: '', label: '', config: {} });
+    }
+  }, [targetConfigRevision]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional
   useEffect(() => {
     recordEvent('webui_page_view', { page: 'redteam_config_target_type_selection' });
-    // Initialize providerType if not already set
-    if (!providerType && config.target?.id) {
-      setProviderType(getProviderType(config.target.id));
+    // Keep persisted providerType aligned with the local selection state on mount.
+    if (hasCompleteSavedConfig && !providerType && config.target?.id) {
+      setProviderType(getProviderEditorType(config.target.id, config.target.config));
+    } else if (!hasCompleteSavedConfig && providerType) {
+      setProviderType(undefined);
     }
   }, []);
 
@@ -59,6 +74,7 @@ export default function TargetTypeSelection({ onNext, onBack }: TargetTypeSelect
     setSelectedTarget(updatedProvider);
     setProviderType(providerType);
     updateConfig('target', updatedProvider);
+    clearTargetConfigValidation?.(JSON.stringify(updatedProvider));
     recordEvent('feature_used', {
       feature: 'redteam_config_target_type_changed',
       target: provider.id,
@@ -66,17 +82,7 @@ export default function TargetTypeSelection({ onNext, onBack }: TargetTypeSelect
   };
 
   const handleNext = () => {
-    // If target type section is not shown yet, show it first
-    if (hasTargetName && !showTargetTypeSection) {
-      setShowTargetTypeSection(true);
-      recordEvent('feature_used', {
-        feature: 'redteam_config_target_type_section_revealed',
-      });
-      return;
-    }
-
-    // If target type section is shown and selection is valid, proceed to next step
-    if (showTargetTypeSection && isValidSelection()) {
+    if (hasTargetName && isValidSelection()) {
       // Track provider type selection when moving to next step
       recordEvent('feature_used', {
         feature: 'redteam_config_provider_selected',
@@ -108,25 +114,12 @@ export default function TargetTypeSelection({ onNext, onBack }: TargetTypeSelect
     return !hasTargetName || !isValidSelection();
   };
 
-  const shouldShowFooterButton = () => {
-    return showTargetTypeSection;
-  };
-
   const getNextButtonTooltip = () => {
-    if (!showTargetTypeSection) {
-      return 'Please select a target type first';
-    }
     if (!hasTargetName) {
       return 'Please enter a target name';
     }
     if (!isValidSelection()) {
-      if (!selectedTarget.id && !selectedTarget.label?.trim()) {
-        return 'Please select a target provider';
-      }
-      if (selectedTarget.id === '' && !selectedTarget.label?.trim()) {
-        return 'Please enter a label for your custom provider';
-      }
-      return 'Please complete the target selection';
+      return 'Please select a target type';
     }
     return undefined;
   };
@@ -135,17 +128,15 @@ export default function TargetTypeSelection({ onNext, onBack }: TargetTypeSelect
     <PageWrapper
       title="Target Setup"
       description="Configure the AI system you want to test"
-      onNext={shouldShowFooterButton() ? handleNext : undefined}
+      onNext={handleNext}
       onBack={onBack}
-      nextLabel={shouldShowFooterButton() ? getNextButtonText() : undefined}
-      nextDisabled={shouldShowFooterButton() ? isNextButtonDisabled() : true}
-      warningMessage={
-        shouldShowFooterButton() && isNextButtonDisabled() ? getNextButtonTooltip() : undefined
-      }
+      nextLabel={getNextButtonText()}
+      nextDisabled={isNextButtonDisabled()}
+      warningMessage={isNextButtonDisabled() ? getNextButtonTooltip() : undefined}
     >
       <div className="flex flex-col gap-6">
         {/* Quick Start */}
-        <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-muted px-4 py-3">
+        <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <p className="text-sm text-foreground">
             New to red teaming? Load an example to explore the setup.
           </p>
@@ -167,49 +158,20 @@ export default function TargetTypeSelection({ onNext, onBack }: TargetTypeSelect
               setSelectedTarget(newTarget);
               updateConfig('target', newTarget);
             }}
-            onKeyDown={(e) => {
-              if (isInputComposing(e)) {
-                return;
-              }
-              if (e.key === 'Enter' && hasTargetName && !showTargetTypeSection) {
-                setShowTargetTypeSection(true);
-                recordEvent('feature_used', {
-                  feature: 'redteam_config_target_type_section_revealed',
-                });
-              }
-            }}
             autoFocus
           />
         </div>
 
-        {/* Continue button - shown before target type is revealed */}
-        {hasTargetName && !showTargetTypeSection && (
-          <div>
-            <Button
-              onClick={() => {
-                setShowTargetTypeSection(true);
-                recordEvent('feature_used', {
-                  feature: 'redteam_config_target_type_section_revealed',
-                });
-              }}
-            >
-              Continue
-            </Button>
-          </div>
-        )}
-
         {/* Target Type Selection */}
-        {showTargetTypeSection && (
-          <section className="space-y-4">
-            <Label className="text-sm font-semibold">Select Target Type</Label>
+        <section className="space-y-4">
+          <Label className="text-sm font-semibold">Select Target Type</Label>
 
-            <ProviderTypeSelector
-              provider={selectedTarget}
-              setProvider={handleProviderChange}
-              providerType={providerType}
-            />
-          </section>
-        )}
+          <ProviderTypeSelector
+            provider={selectedTarget}
+            setProvider={handleProviderChange}
+            providerType={providerType}
+          />
+        </section>
       </div>
     </PageWrapper>
   );

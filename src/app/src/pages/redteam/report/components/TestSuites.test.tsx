@@ -2,11 +2,11 @@ import { mockObjectUrl, mockWindowLocation } from '@app/tests/browserMocks';
 import { renderWithProviders } from '@app/utils/testutils';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TestSuites from './TestSuites';
 
-vi.mock('react-router-dom', () => ({
+vi.mock('react-router', () => ({
   useNavigate: vi.fn(),
 }));
 
@@ -377,6 +377,17 @@ describe('TestSuites Component CSV Export', () => {
     const exportButton = screen.getByText('Export vulnerabilities to CSV');
     expect(exportButton).toBeInTheDocument();
     expect(exportButton.closest('button')).toBeInTheDocument();
+  });
+
+  it('stacks the header controls on narrow screens', () => {
+    renderWithProviders(<TestSuites {...defaultProps} />);
+
+    expect(screen.getByTestId('vulnerabilities-header')).toHaveClass(
+      'flex-col',
+      'items-start',
+      'sm:flex-row',
+      'sm:justify-between',
+    );
   });
 });
 

@@ -1,7 +1,8 @@
 import logger from '../logger';
 import { safeJsonStringify } from '../util/json';
 import { getProcessShim } from '../util/processShim';
-import { sanitizeObject } from '../util/sanitizer';
+import { sanitizeProviderObject } from './providerLogging';
+import { normalizeResponseTransformResult } from './transformResult';
 
 import type { FetchWithCacheResult } from '../cache';
 import type { CallApiContextParams, ProviderResponse } from '../types/index';
@@ -12,7 +13,7 @@ export interface TransformResponseContext {
 
 // This is in another module so it can be imported by the frontend
 // Useful to test these in the UI before running an eval
-// Note: file:// references should be pre-loaded in http.ts using loadTransformModule
+// Note: file:// references should be pre-loaded using loadTransformModule
 // before being passed to this function. This is because we can't use importModule in the frontend.
 export async function createTransformResponse(
   parser: string | Function | undefined,
@@ -25,11 +26,7 @@ export async function createTransformResponse(
     return (data, text, context) => {
       try {
         const result = parser(data, text, context);
-        if (typeof result === 'object') {
-          return result;
-        } else {
-          return { output: result };
-        }
+        return normalizeResponseTransformResult(result);
       } catch (err) {
         logger.error(
           `[Http Provider] Error in response transform function: ${String(err)}. Data: ${safeJsonStringify(data)}. Text: ${text}. Context: ${safeJsonStringify(context)}.`,
@@ -39,7 +36,7 @@ export async function createTransformResponse(
     };
   }
   if (typeof parser === 'string' && parser.startsWith('file://')) {
-    // This should have been pre-loaded in http.ts using loadTransformModule
+    // This should have been pre-loaded using loadTransformModule
     throw new Error(
       `Response transform with file:// reference should be pre-loaded before calling createTransformResponse. This is a bug in the HTTP provider implementation.`,
     );
@@ -59,18 +56,10 @@ export async function createTransformResponse(
             ? `try { return (${trimmedParser})(json, text, context); } catch(e) { throw new Error('Transform failed: ' + e.message + ' : ' + text + ' : ' + JSON.stringify(json) + ' : ' + JSON.stringify(context)); }`
             : `try { return (${trimmedParser}); } catch(e) { throw new Error('Transform failed: ' + e.message + ' : ' + text + ' : ' + JSON.stringify(json) + ' : ' + JSON.stringify(context)); }`,
         );
-        let resp: ProviderResponse | string;
         const processShim = getProcessShim();
-        if (context) {
-          resp = transformFn(data || null, text, context, processShim);
-        } else {
-          resp = transformFn(data || null, text, undefined, processShim);
-        }
+        const resp = transformFn(data || null, text, context || undefined, processShim);
 
-        if (typeof resp === 'string') {
-          return { output: resp };
-        }
-        return resp;
+        return normalizeResponseTransformResult(resp);
       } catch (err) {
         logger.error(
           `[Http Provider] Error in response transform: ${String(err)}. Data: ${safeJsonStringify(data)}. Text: ${text}. Context: ${safeJsonStringify(context)}.`,
@@ -106,7 +95,7 @@ export async function createTransformRequest(
   }
 
   if (typeof transform === 'string' && transform.startsWith('file://')) {
-    // This should have been pre-loaded in http.ts using loadTransformModule
+    // This should have been pre-loaded using loadTransformModule
     throw new Error(
       `Request transform with file:// reference should be pre-loaded before calling createTransformRequest. This is a bug in the HTTP provider implementation.`,
     );
@@ -117,53 +106,26 @@ export async function createTransformRequest(
         // Check if it's a function expression (either arrow or regular)
         const isFunctionExpression = /^(\(.*?\)\s*=>|function\s*\(.*?\))/.test(trimmedTransform);
 
-        let transformFn: Function;
-        // Add process parameter for ESM compatibility - allows process.mainModule.require to work
+        let body: string;
         if (isFunctionExpression) {
           // For function expressions, call them with the arguments
-          transformFn = new Function(
-            'prompt',
-            'vars',
-            'context',
-            'process',
-            `try { return (${trimmedTransform})(prompt, vars, context); } catch(e) { throw new Error('Transform failed: ' + e.message) }`,
-          );
+          body = `try { return (${trimmedTransform})(prompt, vars, context); } catch(e) { throw new Error('Transform failed: ' + e.message) }`;
         } else {
           // Check if it contains a return statement
           const hasReturn = /\breturn\b/.test(trimmedTransform);
-
-          if (hasReturn) {
-            // Use as function body if it has return statements
-            transformFn = new Function(
-              'prompt',
-              'vars',
-              'context',
-              'process',
-              `try { ${trimmedTransform} } catch(e) { throw new Error('Transform failed: ' + e.message); }`,
-            );
-          } else {
-            // Wrap simple expressions with return
-            transformFn = new Function(
-              'prompt',
-              'vars',
-              'context',
-              'process',
-              `try { return (${trimmedTransform}); } catch(e) { throw new Error('Transform failed: ' + e.message); }`,
-            );
-          }
+          // Use as function body if it has return statements; otherwise wrap the expression.
+          body = hasReturn
+            ? `try { ${trimmedTransform} } catch(e) { throw new Error('Transform failed: ' + e.message); }`
+            : `try { return (${trimmedTransform}); } catch(e) { throw new Error('Transform failed: ' + e.message); }`;
         }
+        // Add process parameter for ESM compatibility - allows process.mainModule.require to work
+        const transformFn = new Function('prompt', 'vars', 'context', 'process', body);
 
-        let result: any;
         const processShim = getProcessShim();
-        if (context) {
-          result = await transformFn(prompt, vars, context, processShim);
-        } else {
-          result = await transformFn(prompt, vars, undefined, processShim);
-        }
-        return result;
+        return await transformFn(prompt, vars, context || undefined, processShim);
       } catch (err) {
         logger.error(
-          `[Http Provider] Error in request transform: ${String(err)}. Prompt: ${prompt}. Vars: ${safeJsonStringify(vars)}. Context: ${safeJsonStringify(sanitizeObject(context, { context: 'request transform' }))}.`,
+          `[Http Provider] Error in request transform: ${String(err)}. Prompt: ${prompt}. Vars: ${safeJsonStringify(vars)}. Context: ${safeJsonStringify(sanitizeProviderObject(context, 'request transform'))}.`,
         );
         throw new Error(`Failed to transform request: ${String(err)}`);
       }

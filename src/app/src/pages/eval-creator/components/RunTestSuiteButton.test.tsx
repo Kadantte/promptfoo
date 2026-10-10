@@ -1,6 +1,11 @@
-import { EvalHistoryProvider } from '@app/contexts/EvalHistoryContext';
+import { createDefaultProvider } from '@app/pages/redteam/setup/components/Targets/providerCatalog';
 import { useStore } from '@app/stores/evalConfig';
-import { mockCallApiRoutes, rejectCallApi, resetCallApiMock } from '@app/tests/apiMocks';
+import {
+  getCallApiMock,
+  mockCallApiRoutes,
+  rejectCallApi,
+  resetCallApiMock,
+} from '@app/tests/apiMocks';
 import { type TestTimers, useTestTimers } from '@app/tests/timers';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -8,13 +13,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import RunTestSuiteButton from './RunTestSuiteButton';
 
 const renderWithProvider = (ui: React.ReactElement) => {
-  return render(<EvalHistoryProvider>{ui}</EvalHistoryProvider>);
+  return render(ui);
 };
 
 const mockShowToast = vi.fn();
+let sourceEvalId: string | undefined;
 
-vi.mock('react-router-dom', () => ({
+vi.mock('react-router', () => ({
   useNavigate: () => vi.fn(),
+  useLocation: () => ({ state: sourceEvalId ? { sourceEvalId } : null }),
 }));
 
 vi.mock('@app/utils/api', () => ({
@@ -34,8 +41,71 @@ describe('RunTestSuiteButton', () => {
     useStore.getState().reset();
     resetCallApiMock();
     mockShowToast.mockReset();
+    sourceEvalId = undefined;
     timers = useTestTimers();
   });
+
+  it.each(
+    ['llamafile', 'vllm', 'text-generation-webui'].flatMap((type) =>
+      ['none', 'inline', 'selected'].map((auth) => ({ type, auth })),
+    ),
+  )(
+    'submits the rehydrated $type target with its credential policy ($auth)',
+    async ({ type, auth }) => {
+      const initial = createDefaultProvider(type)!;
+      const provider = {
+        ...initial,
+        id: 'openai:chat:tenant/private-served-model:Q4_K_M',
+        config: {
+          ...initial.config,
+          apiBaseUrl: 'https://private-inference.example.test/tenant/v1',
+          stop: ['<end>'],
+          passthrough: { chat_template_kwargs: { enable_thinking: false } },
+          ...(auth === 'inline' ? { apiKey: 'private-session-key' } : {}),
+          ...(auth === 'selected' ? { apiKeyEnvar: 'LOCAL_MODEL_KEY' } : {}),
+        },
+      };
+      act(() =>
+        useStore.getState().setConfig({
+          providers: [provider],
+          prompts: ['Hello'],
+          tests: [{}],
+        }),
+      );
+      const persisted = localStorage.getItem('promptfoo')!;
+      expect(persisted).not.toContain('private-session-key');
+      await act(async () => {
+        useStore.setState({ config: {} });
+        localStorage.setItem('promptfoo', persisted);
+        await useStore.persist.rehydrate();
+      });
+      mockCallApiRoutes([{ method: 'POST', path: '/eval/job', response: { id: 'local-job' } }]);
+      renderWithProvider(<RunTestSuiteButton />);
+      await act(async () => {
+        screen
+          .getByRole('button', { name: 'Run Eval' })
+          .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        await Promise.resolve();
+      });
+      const [, request] = getCallApiMock().mock.calls[0] as [string, RequestInit];
+      const [submitted] = JSON.parse(request.body as string).providers;
+      expect(submitted).toMatchObject({
+        id: provider.id,
+        config: {
+          type,
+          apiBaseUrl: provider.config.apiBaseUrl,
+          apiKeyRequired: false,
+          useDefaultApiKey: false,
+          stop: ['<end>'],
+          passthrough: provider.config.passthrough,
+        },
+      });
+      expect(submitted.config).not.toHaveProperty('apiKey');
+      if (auth === 'selected') {
+        expect(submitted.config.apiKeyEnvar).toBe('LOCAL_MODEL_KEY');
+      }
+    },
+  );
 
   it('should be disabled when there are no prompts or tests', () => {
     renderWithProvider(<RunTestSuiteButton />);
@@ -66,6 +136,136 @@ describe('RunTestSuiteButton', () => {
     renderWithProvider(<RunTestSuiteButton />);
     const button = screen.getByRole('button', { name: 'Run Eval' });
     expect(button).not.toBeDisabled();
+  });
+
+  it('should be enabled for scalar provider, prompt, and test configs', () => {
+    useStore.getState().updateConfig({
+      prompts: 'file://prompt.txt',
+      providers: 'openai:gpt-4',
+      tests: 'file://tests.csv',
+    });
+
+    renderWithProvider(<RunTestSuiteButton />);
+
+    expect(screen.getByRole('button', { name: 'Run Eval' })).not.toBeDisabled();
+  });
+
+  it('should serialize scalar prompt configs as an array before submitting eval jobs', async () => {
+    mockCallApiRoutes([{ method: 'POST', path: '/eval/job', response: { id: '123' } }]);
+    useStore.getState().updateConfig({
+      prompts: 'file://prompt.txt',
+      providers: 'openai:gpt-4',
+      tests: 'file://tests.csv',
+    });
+
+    renderWithProvider(<RunTestSuiteButton />);
+    await act(async () => {
+      screen
+        .getByRole('button', { name: 'Run Eval' })
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+
+    const [, requestInit] = getCallApiMock().mock.calls[0] as [string, RequestInit];
+    expect(typeof requestInit.body).toBe('string');
+    expect(JSON.parse(requestInit.body as string)).toMatchObject({
+      prompts: ['file://prompt.txt'],
+      providers: 'openai:gpt-4',
+      tests: 'file://tests.csv',
+    });
+  });
+
+  it('should serialize legacy prompt maps into prompt objects before submitting eval jobs', async () => {
+    mockCallApiRoutes([{ method: 'POST', path: '/eval/job', response: { id: '123' } }]);
+    useStore.getState().updateConfig({
+      prompts: { 'file://prompt.txt': 'Prompt label' },
+      providers: 'openai:gpt-4',
+      tests: 'file://tests.csv',
+    });
+
+    renderWithProvider(<RunTestSuiteButton />);
+    await act(async () => {
+      screen
+        .getByRole('button', { name: 'Run Eval' })
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+
+    const [, requestInit] = getCallApiMock().mock.calls[0] as [string, RequestInit];
+    expect(typeof requestInit.body).toBe('string');
+    expect(JSON.parse(requestInit.body as string)).toMatchObject({
+      prompts: [{ raw: 'file://prompt.txt', label: 'Prompt label' }],
+      providers: 'openai:gpt-4',
+      tests: 'file://tests.csv',
+    });
+  });
+
+  it('includes trace-provider settings and runtime credentials in submitted eval jobs', async () => {
+    mockCallApiRoutes([{ method: 'POST', path: '/eval/job', response: { id: '123' } }]);
+    const tracing = {
+      enabled: true,
+      queryDelay: 3000,
+      provider: {
+        id: 'tempo' as const,
+        endpoint: 'https://tempo.example.com/team-west',
+        auth: { token: 'browser-runtime-secret' },
+        headers: { 'X-Scope-OrgID': 'tenant-a' },
+      },
+    };
+    useStore.getState().updateConfig({
+      prompts: ['prompt 1'],
+      providers: ['echo'],
+      tests: [{ vars: { prompt: 'hello' } }],
+      tracing,
+    });
+
+    renderWithProvider(<RunTestSuiteButton />);
+    await act(async () => {
+      screen
+        .getByRole('button', { name: 'Run Eval' })
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+
+    const [, requestInit] = getCallApiMock().mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(requestInit.body as string)).toMatchObject({ tracing });
+    expect(localStorage.getItem('promptfoo')).not.toContain('browser-runtime-secret');
+  });
+
+  it('should include the source eval id when rerunning a loaded evaluation', async () => {
+    sourceEvalId = 'source-eval-id';
+    mockCallApiRoutes([{ method: 'POST', path: '/eval/job', response: { id: '123' } }]);
+    useStore.getState().updateConfig({
+      prompts: ['prompt 1'],
+      providers: ['echo'],
+      tests: 'az://account/container/tests.yaml?sp=r&sig=%5BREDACTED%5D',
+    });
+
+    renderWithProvider(<RunTestSuiteButton />);
+    await act(async () => {
+      screen
+        .getByRole('button', { name: 'Run Eval' })
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+
+    const [, requestInit] = getCallApiMock().mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(requestInit.body as string)).toMatchObject({
+      sourceEvalId: 'source-eval-id',
+      tests: 'az://account/container/tests.yaml?sp=r&sig=%5BREDACTED%5D',
+    });
+  });
+
+  it('should be disabled for provider option objects without ids', () => {
+    useStore.getState().updateConfig({
+      prompts: ['prompt 1'],
+      providers: [{ label: 'Missing id', config: { foo: 'bar' } }],
+      tests: [{ vars: { foo: 'bar' } }],
+    });
+
+    renderWithProvider(<RunTestSuiteButton />);
+
+    expect(screen.getByRole('button', { name: 'Run Eval' })).toBeDisabled();
   });
 
   it('should handle progress API failure after job creation', async () => {
@@ -134,5 +334,72 @@ describe('RunTestSuiteButton', () => {
     });
 
     expect(screen.getByRole('button', { name: 'Run Eval' })).toBeInTheDocument();
+  });
+
+  it('should stop polling when unmounted', async () => {
+    const mockJobId = '123';
+    mockCallApiRoutes([{ method: 'POST', path: '/eval/job', response: { id: mockJobId } }]);
+
+    useStore.getState().updateConfig({
+      prompts: ['prompt 1'],
+      providers: ['openai:gpt-4'],
+      tests: [{ vars: { foo: 'bar' } }],
+    });
+
+    const { unmount } = renderWithProvider(<RunTestSuiteButton />);
+    const button = screen.getByRole('button', { name: 'Run Eval' });
+
+    await act(async () => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+
+    unmount();
+
+    await act(async () => {
+      await timers.advanceByAsync(1500);
+    });
+
+    expect(getCallApiMock()).toHaveBeenCalledTimes(1);
+  });
+
+  it('should not start polling if unmounted before job creation finishes', async () => {
+    let resolveJobCreation: ((value: Response) => void) | undefined;
+    getCallApiMock().mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveJobCreation = resolve;
+        }),
+    );
+
+    useStore.getState().updateConfig({
+      prompts: ['prompt 1'],
+      providers: ['openai:gpt-4'],
+      tests: [{ vars: { foo: 'bar' } }],
+    });
+
+    const { unmount } = renderWithProvider(<RunTestSuiteButton />);
+    const button = screen.getByRole('button', { name: 'Run Eval' });
+
+    await act(async () => {
+      button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+    });
+
+    unmount();
+
+    await act(async () => {
+      resolveJobCreation?.(
+        new Response(JSON.stringify({ id: 'late-job' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      await timers.advanceByAsync(1500);
+    });
+
+    expect(getCallApiMock()).toHaveBeenCalledTimes(1);
   });
 });

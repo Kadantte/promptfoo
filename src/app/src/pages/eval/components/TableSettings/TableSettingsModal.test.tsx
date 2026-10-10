@@ -1,6 +1,4 @@
-import { useState } from 'react';
-
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useSettingsState } from './hooks/useSettingsState';
@@ -17,34 +15,29 @@ vi.mock('./components/SettingsPanel', () => ({
 describe('TableSettingsModal', () => {
   const mockOnClose = vi.fn();
   const mockResetToDefaults = vi.fn();
-
-  const mockSettingsState = (hasChanges: boolean) => {
-    vi.mocked(useSettingsState).mockReturnValue({
-      hasChanges,
-      resetToDefaults: mockResetToDefaults,
-      store: {} as any,
-      localMaxTextLength: 500,
-      setLocalMaxTextLength: vi.fn(),
-      handleSliderChange: vi.fn(),
-      handleSliderChangeCommitted: vi.fn(),
-    });
+  const mockOnResultsTableZoomChange = vi.fn();
+  const defaultProps = {
+    open: true,
+    onClose: mockOnClose,
+    resultsTableZoom: 1,
+    onResultsTableZoomChange: mockOnResultsTableZoomChange,
   };
 
   beforeEach(() => {
     vi.clearAllMocks();
 
-    mockSettingsState(false);
+    vi.mocked(useSettingsState).mockReturnValue({ resetToDefaults: mockResetToDefaults });
   });
 
   it("should not render the settings dialog when 'open' is false", () => {
-    render(<TableSettingsModal open={false} onClose={mockOnClose} />);
+    render(<TableSettingsModal {...defaultProps} open={false} />);
 
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(screen.queryByText('Table Settings')).not.toBeInTheDocument();
   });
 
   it("should render the settings dialog when 'open' is true", () => {
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
+    render(<TableSettingsModal {...defaultProps} />);
 
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     expect(screen.getByText('Table Settings')).toBeInTheDocument();
@@ -52,7 +45,7 @@ describe('TableSettingsModal', () => {
 
   it('should call the onClose callback when the close button is clicked', async () => {
     const user = userEvent.setup();
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
+    render(<TableSettingsModal {...defaultProps} />);
     const closeButton = screen.getByRole('button', { name: 'Close' });
     await user.click(closeButton);
     expect(mockOnClose).toHaveBeenCalledTimes(1);
@@ -60,73 +53,52 @@ describe('TableSettingsModal', () => {
 
   it('should call resetToDefaults when the "Reset to Defaults" button is clicked', async () => {
     const user = userEvent.setup();
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
+    render(<TableSettingsModal {...defaultProps} />);
 
     const resetButton = screen.getByRole('button', { name: 'Reset settings to defaults' });
     await user.click(resetButton);
 
     expect(mockResetToDefaults).toHaveBeenCalled();
+    expect(mockOnResultsTableZoomChange).toHaveBeenCalledWith(1);
   });
 
   it('should display "Done" button', () => {
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
+    render(<TableSettingsModal {...defaultProps} />);
     expect(screen.getByRole('button', { name: 'Done' })).toBeInTheDocument();
-  });
-
-  it('should call useSettingsState with the correct initial open state', () => {
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
-    expect(useSettingsState).toHaveBeenCalledWith(true);
   });
 
   it('should call onClose when the Done button is clicked', async () => {
     const user = userEvent.setup();
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
+    render(<TableSettingsModal {...defaultProps} />);
     const mainActionButton = screen.getByRole('button', { name: 'Done' });
     await user.click(mainActionButton);
     expect(mockOnClose).toHaveBeenCalledTimes(1);
   });
 
   it('should render the dialog with proper sizing', () => {
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
+    render(<TableSettingsModal {...defaultProps} />);
 
     const dialog = screen.getByRole('dialog');
 
     // The dialog uses Radix UI with Tailwind classes for sizing
-    expect(dialog).toHaveClass('max-w-[680px]');
+    expect(dialog).toHaveClass('max-h-[90vh]', 'max-w-[680px]', 'flex-col');
   });
 
-  it('should call the onClose callback when the modal is closed unexpectedly with unsaved changes', async () => {
-    const user = userEvent.setup();
-    mockSettingsState(true);
+  it('keeps the settings body scrollable while the footer stays visible', () => {
+    render(<TableSettingsModal {...defaultProps} />);
 
-    render(<TableSettingsModal open={true} onClose={mockOnClose} />);
-
-    const closeButton = screen.getByRole('button', { name: 'Close' });
-    await user.click(closeButton);
-
-    expect(mockOnClose).toHaveBeenCalledTimes(1);
+    const settingsPanel = screen.getByTestId('mock-settings-panel');
+    expect(settingsPanel.parentElement).toHaveClass('min-h-0', 'overflow-y-auto');
+    expect(screen.getByRole('button', { name: 'Done' }).closest('div')).toHaveClass('shrink-0');
   });
 
-  it('should handle prop changes while the modal is open', async () => {
-    const TestComponent = () => {
-      const [isOpen, setIsOpen] = useState(true);
-
-      setTimeout(() => {
-        setIsOpen(false);
-      }, 50);
-
-      return <TableSettingsModal open={isOpen} onClose={mockOnClose} />;
-    };
-
-    render(<TestComponent />);
+  it('should handle prop changes while the modal is open', () => {
+    const { rerender } = render(<TableSettingsModal {...defaultProps} />);
 
     expect(screen.getByRole('dialog')).toBeInTheDocument();
 
-    await waitFor(
-      () => {
-        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-      },
-      { timeout: 300 },
-    );
+    rerender(<TableSettingsModal {...defaultProps} open={false} />);
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });

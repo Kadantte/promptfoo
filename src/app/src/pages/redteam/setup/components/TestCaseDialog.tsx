@@ -34,6 +34,7 @@ import {
   type Strategy,
 } from '@promptfoo/redteam/constants';
 import { ExternalLink, Info, Sparkles } from 'lucide-react';
+import { useRedTeamTargetConfigValidation } from '../hooks/useRedTeamTargetConfigValidation';
 import {
   getPluginDocumentationUrl,
   hasSpecificPluginDocumentation,
@@ -159,7 +160,7 @@ export const TestCaseDialog: React.FC<TestCaseDialogProps> = ({
         className="z-[10000] flex max-h-[85vh] flex-col sm:max-w-3xl"
         data-testid="test-case-dialog"
       >
-        <DialogHeader className="flex flex-row items-start justify-between gap-4 pr-8">
+        <DialogHeader className="flex flex-col items-start gap-4 pr-8 sm:flex-row sm:justify-between">
           <div>
             <DialogTitle>
               {allowPluginChange
@@ -182,7 +183,7 @@ export const TestCaseDialog: React.FC<TestCaseDialogProps> = ({
                 }
               }}
             >
-              <SelectTrigger className="w-[280px]" data-testid="plugin-dropdown">
+              <SelectTrigger className="w-full sm:w-[280px]" data-testid="plugin-dropdown">
                 <SelectValue placeholder="Select plugin" />
               </SelectTrigger>
               <SelectContent className="z-[10001]">
@@ -266,6 +267,7 @@ export const TestCaseGenerateButton: React.FC<{
     data: { status: apiHealthStatus },
   } = useApiHealth();
   const isRemoteDisabled = apiHealthStatus !== 'connected';
+  const { targetConfigError } = useRedTeamTargetConfigValidation();
 
   // Tooltip component uses controlled state in order to imperatively close it when the Test Case
   // Generation dialog is rendered (by default it will remain open even after the dialog is closed).
@@ -275,6 +277,10 @@ export const TestCaseGenerateButton: React.FC<{
   const hideTooltip = () => setShouldRenderTooltip(false);
 
   const iconSize = size === 'small' ? 'h-4 w-4' : 'h-5 w-5';
+  const buttonLabel =
+    targetConfigError ||
+    tooltipTitle ||
+    (isRemoteDisabled ? 'Requires Promptfoo Cloud connection' : 'Generate a test case');
 
   return (
     <Tooltip open={shouldRenderTooltip} onOpenChange={setShouldRenderTooltip}>
@@ -282,12 +288,13 @@ export const TestCaseGenerateButton: React.FC<{
         <Button
           variant="ghost"
           size="icon"
+          aria-label={buttonLabel}
           onClick={(e) => {
             e.stopPropagation();
             hideTooltip();
             onClick();
           }}
-          disabled={disabled || isRemoteDisabled}
+          disabled={disabled || isRemoteDisabled || Boolean(targetConfigError)}
           className="text-muted-foreground hover:text-foreground"
           onMouseEnter={showTooltip}
           onMouseLeave={hideTooltip}
@@ -296,9 +303,10 @@ export const TestCaseGenerateButton: React.FC<{
         </Button>
       </TooltipTrigger>
       <TooltipContent>
-        {isRemoteDisabled
-          ? 'Requires Promptfoo Cloud connection'
-          : tooltipTitle || 'Generate test case'}
+        {targetConfigError ||
+          (isRemoteDisabled
+            ? 'Requires Promptfoo Cloud connection'
+            : tooltipTitle || 'Generate test case')}
       </TooltipContent>
     </Tooltip>
   );

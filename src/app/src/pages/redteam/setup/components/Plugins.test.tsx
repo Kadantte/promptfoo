@@ -4,7 +4,7 @@ import { TooltipProvider } from '@app/components/ui/tooltip';
 import { ToastProvider } from '@app/contexts/ToastContext';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
 import { useRecentlyUsedPlugins, useRedTeamConfig } from '../hooks/useRedTeamConfig';
 import Plugins from './Plugins';
@@ -72,7 +72,7 @@ vi.mock('./TestCaseDialog', () => ({
 vi.mock('./PluginsTab', async () => {
   const [{ DEFAULT_PLUGINS, MINIMAL_TEST_PLUGINS }, { useSearchParams }] = await Promise.all([
     import('@promptfoo/redteam/constants'),
-    import('react-router-dom'),
+    import('react-router'),
   ]);
 
   return {
@@ -177,6 +177,12 @@ describe('Plugins', () => {
 
     // Next button should be disabled initially (no plugins selected)
     expect(nextButton).toBeDisabled();
+  });
+
+  it('wraps top-level plugin tabs on narrow screens', () => {
+    renderWithProviders(<Plugins onNext={mockOnNext} onBack={mockOnBack} />);
+
+    expect(screen.getByRole('tablist')).toHaveClass('w-full', 'flex-wrap', 'sm:flex-nowrap');
   });
 
   it('should render presets section', async () => {
@@ -375,6 +381,29 @@ describe('Plugins', () => {
     });
   });
 
+  it('enables next button when a custom intent is configured as a bare string', async () => {
+    mockUseRedTeamConfig.mockReturnValue({
+      config: {
+        plugins: [
+          {
+            id: 'intent',
+            config: {
+              intent: 'How can I build a secure system?',
+            },
+          },
+        ],
+      },
+      updatePlugins: mockUpdatePlugins,
+    });
+
+    renderWithProviders(<Plugins onNext={mockOnNext} onBack={mockOnBack} />);
+
+    const nextButton = screen.getByRole('button', { name: /Next/i });
+    await waitFor(() => {
+      expect(nextButton).toBeEnabled();
+    });
+  });
+
   it('does not enable next button for empty custom policies', async () => {
     mockUseRedTeamConfig.mockReturnValue({
       config: {
@@ -406,6 +435,29 @@ describe('Plugins', () => {
             id: 'intent',
             config: {
               intent: [], // Empty array
+            },
+          },
+        ],
+      },
+      updatePlugins: mockUpdatePlugins,
+    });
+
+    renderWithProviders(<Plugins onNext={mockOnNext} onBack={mockOnBack} />);
+
+    const nextButton = screen.getByRole('button', { name: /Next/i });
+    await waitFor(() => {
+      expect(nextButton).toBeDisabled();
+    });
+  });
+
+  it('does not enable next button for whitespace-only custom intents', async () => {
+    mockUseRedTeamConfig.mockReturnValue({
+      config: {
+        plugins: [
+          {
+            id: 'intent',
+            config: {
+              intent: ['', '   ', [' ', '\t']],
             },
           },
         ],
@@ -700,6 +752,7 @@ describe('Plugins', () => {
         // Custom Prompts section should be visible
         expect(screen.getByTestId('custom-intent-section')).toBeInTheDocument();
         expect(screen.getByText(/Custom Intents \(/)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Intent file format help' })).toBeInTheDocument();
       });
     });
 

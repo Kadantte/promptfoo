@@ -2,17 +2,17 @@ import { PageContainer } from '@app/components/layout/PageContainer';
 import { PageHeader } from '@app/components/layout/PageHeader';
 import { Card } from '@app/components/ui/card';
 import { REDTEAM_ROUTES } from '@app/constants/routes';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import ReportsTable from './ReportsTable';
 
 export default function ReportIndex() {
   const navigate = useNavigate();
 
   return (
-    <PageContainer className="fixed top-14 left-0 right-0 bottom-0 overflow-y-auto">
+    <PageContainer className="fixed top-[calc(var(--nav-height)_+_var(--update-banner-height,0px))] left-0 right-0 bottom-0 overflow-y-auto">
       <PageHeader>
         <div className="container max-w-7xl mx-auto p-6">
-          <h1 className="text-2xl font-semibold">Red Team Reports</h1>
+          <h1 className="text-2xl font-bold tracking-tight">Red Team Reports</h1>
           <p className="text-sm text-muted-foreground mt-1">
             View and analyze your red team vulnerability scans
           </p>

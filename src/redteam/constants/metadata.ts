@@ -16,6 +16,8 @@ export const subCategoryDescriptions: Record<Plugin | Strategy, string> = {
   aegis: "Tests content safety handling using NVIDIA's Aegis dataset",
   'ascii-smuggling': 'Tests vulnerability to Unicode tag-based instruction smuggling attacks',
   audio: 'Tests handling of audio content',
+  'arabic-presentation-forms':
+    'Tests handling of Arabic presentation-forms encoding and Unicode normalization in content filters',
   'authoritative-markup-injection': 'Tests vulnerability to authoritative markup injection attacks',
   layer: 'Applies multiple strategies in a defined order',
   base64: 'Tests handling of Base64-encoded malicious payloads',
@@ -107,6 +109,8 @@ export const subCategoryDescriptions: Record<Plugin | Strategy, string> = {
   jailbreak:
     '[DEPRECATED] Use jailbreak:meta instead. Single-shot optimization of safety bypass techniques.',
   'jailbreak:composite': 'Combines multiple jailbreak techniques for enhanced effectiveness',
+  'jailbreak:goblin':
+    'Multi-turn jailbreak strategy focused on encoding techniques, math, and logic problems',
   'jailbreak:hydra':
     'Multi-turn conversational attacks with meta-learning that adapts strategy based on full conversation history',
   'jailbreak:likert': 'Uses Likert scale-based prompts to bypass content filters',
@@ -269,6 +273,7 @@ export const displayNameOverrides: Record<Plugin | Strategy, string> = {
   aegis: 'Aegis Dataset',
   'ascii-smuggling': 'ASCII Smuggling',
   audio: 'Audio Content',
+  'arabic-presentation-forms': 'Arabic Presentation Forms',
   'authoritative-markup-injection': 'Authoritative Markup Injection',
   base64: 'Base64 Payload Encoding',
   basic: 'Baseline Testing',
@@ -408,6 +413,7 @@ export const displayNameOverrides: Record<Plugin | Strategy, string> = {
   intent: 'Intent',
   jailbreak: 'Single-shot Optimization [DEPRECATED]',
   'jailbreak:composite': 'Multi-Vector Safety Bypass',
+  'jailbreak:goblin': 'Goblin Multi-turn',
   'jailbreak:hydra': 'Hydra Multi-turn',
   'jailbreak:likert': 'Likert Scale Jailbreak',
   'jailbreak:meta': 'Meta-Agent Strategic Jailbreak',
@@ -763,6 +769,8 @@ export const riskCategories: Record<string, Plugin[]> = {
     'unverifiable-claims',
   ],
 
+  'Coding Agent Security': [...CODING_AGENT_PLUGINS],
+
   'Domain-Specific Risks': [
     'ecommerce:pci-dss',
     'ecommerce:compliance-bypass',
@@ -827,8 +835,6 @@ export const riskCategories: Record<string, Plugin[]> = {
     'vlsu',
     'xstest',
   ],
-
-  'Coding Agent Security': [...CODING_AGENT_PLUGINS],
 };
 
 export const categoryDescriptions = {
@@ -836,10 +842,10 @@ export const categoryDescriptions = {
   'Compliance & Legal': 'Regulatory compliance, legal, and policy violation risks.',
   'Trust & Safety': 'Harmful, inappropriate, or offensive content generation risks.',
   Brand: 'Output reliability, accuracy, and brand reputation risks.',
-  Datasets: 'Pre-defined test cases from research datasets.',
-  'Domain-Specific Risks': 'Specialized risks and failure modes.',
   'Coding Agent Security':
     'Repository prompt injection, terminal output injection, launcher environment disclosure, sandbox read escape, and verifier sabotage risks for coding agents.',
+  'Domain-Specific Risks': 'Specialized risks and failure modes.',
+  Datasets: 'Pre-defined test cases from research datasets.',
 };
 
 export type TopLevelCategory = keyof typeof riskCategories;
@@ -1270,6 +1276,8 @@ export const pluginDescriptions: Record<Plugin, string> = {
 
 export const strategyDescriptions: Record<Strategy, string> = {
   audio: 'Tests detection and handling of audio-based malicious payloads',
+  'arabic-presentation-forms':
+    'Tests detection and handling of Arabic text using isolated Unicode presentation forms',
   'authoritative-markup-injection':
     'Tests detection and handling of authoritative markup injection attacks',
   base64: 'Tests detection and handling of Base64-encoded malicious payloads',
@@ -1292,6 +1300,8 @@ export const strategyDescriptions: Record<Strategy, string> = {
   jailbreak:
     '[DEPRECATED] Use jailbreak:meta instead. Optimizes single-turn attacks to bypass security controls.',
   'jailbreak:composite': 'Chains multiple attack vectors for enhanced effectiveness',
+  'jailbreak:goblin':
+    'Multi-turn jailbreak strategy focused on encoding techniques, math, and logic problems',
   'jailbreak:hydra':
     'Multi-turn conversational attacks with meta-learning that adapts strategy based on full conversation history',
   'jailbreak:likert': 'Uses Likert scale-based prompts to bypass content filters',
@@ -1319,6 +1329,7 @@ export const strategyDescriptions: Record<Strategy, string> = {
 
 export const strategyDisplayNames: Record<Strategy, string> = {
   audio: 'Audio',
+  'arabic-presentation-forms': 'Arabic Presentation Forms',
   'authoritative-markup-injection': 'Authoritative Markup Injection',
   base64: 'Base64 Encoding',
   basic: 'Basic',
@@ -1337,6 +1348,7 @@ export const strategyDisplayNames: Record<Strategy, string> = {
   image: 'Image',
   jailbreak: 'Single-shot Optimization [DEPRECATED]',
   'jailbreak:composite': 'Composite Jailbreaks',
+  'jailbreak:goblin': 'Goblin Multi-Turn',
   'jailbreak:hydra': 'Hydra Multi-Turn',
   'jailbreak:likert': 'Likert Scale Jailbreak',
   'jailbreak:meta': 'Meta Agent',

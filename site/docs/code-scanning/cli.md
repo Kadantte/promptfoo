@@ -17,6 +17,27 @@ Install promptfoo globally:
 npm install -g promptfoo
 ```
 
+Full-repository scans use the pinned filesystem MCP server installed with promptfoo. Keep the installation outside the repository being scanned. If you installed with `--omit=optional`, reinstall with optional dependencies or use `--diffs-only`.
+
+For pnpm 11, add this to the external installation's `pnpm-workspace.yaml` and reinstall. The pinned filesystem server imports Zod without declaring it, so strict dependency resolution needs this package extension:
+
+```yaml title="pnpm-workspace.yaml"
+packageExtensions:
+  '@modelcontextprotocol/server-filesystem@2026.8.31':
+    dependencies:
+      zod: '^4.3.6'
+```
+
+For Yarn Plug'n'Play, add this to the external installation's `.yarnrc.yml` and reinstall. The package extension supplies a dependency omitted by the pinned filesystem server:
+
+```yaml title=".yarnrc.yml"
+pnpEnableEsmLoader: true
+packageExtensions:
+  '@modelcontextprotocol/server-filesystem@2026.8.31':
+    dependencies:
+      zod: '^4.3.6'
+```
+
 Authenticate with your promptfoo account:
 
 ```bash
@@ -55,6 +76,7 @@ promptfoo code-scans run [repo-path] [options]
 | `--api-host <url>`                | Promptfoo API host URL                                                                              | `https://api.promptfoo.app`                          |
 | `--diffs-only`                    | Scan only PR diffs, don't explore full repo                                                         | false                                                |
 | `--json`                          | Output results as JSON ([see schema](#json-output-schema))                                          | false                                                |
+| `-f, --format <format>`           | Output format (`text`, `json`, or `sarif`)                                                          | `text`                                               |
 | `--github-pr <owner/repo#number>` | Post comments to GitHub PR (used with [Promptfoo GitHub Action](/docs/code-scanning/github-action)) | None                                                 |
 
 ### Examples
@@ -90,6 +112,14 @@ promptfoo code-scans run --json
 ```
 
 See [JSON Output Schema](#json-output-schema) for the response format.
+
+**Get SARIF output for security tooling:**
+
+```bash
+promptfoo code-scans run --format sarif > promptfoo-code-scan.sarif
+```
+
+SARIF output includes location-backed findings that GitHub Code Scanning can display.
 
 ## Configuration File
 
@@ -179,13 +209,14 @@ When using `--json`, the scan outputs a JSON object to stdout with the following
 
 ### Response Object
 
-| Field            | Type        | Description                             |
-| ---------------- | ----------- | --------------------------------------- |
-| `success`        | `boolean`   | Whether the scan completed successfully |
-| `review`         | `string`    | Overall review summary of the scan      |
-| `comments`       | `Comment[]` | Array of findings (see below)           |
-| `commentsPosted` | `boolean`   | Whether comments were posted to a PR    |
-| `error`          | `string`    | Error message if the scan failed        |
+| Field            | Type        | Description                                                                                                       |
+| ---------------- | ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| `success`        | `boolean`   | Whether the scan completed successfully                                                                           |
+| `review`         | `string`    | Overall review summary of the scan                                                                                |
+| `comments`       | `Comment[]` | Array of findings (see below)                                                                                     |
+| `commentsPosted` | `boolean`   | Whether comments were posted to a PR                                                                              |
+| `skipReason`     | `string`    | Set when the scan was intentionally skipped (e.g. fork PR awaiting maintainer approval); `comments` will be empty |
+| `error`          | `string`    | Error message if the scan failed                                                                                  |
 
 ### Comment Object
 

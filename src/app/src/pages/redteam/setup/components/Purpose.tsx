@@ -18,7 +18,9 @@ import { formatToolsAsJSDocs } from '@app/utils/discovery';
 import { type TargetPurposeDiscoveryResult } from '@promptfoo/redteam/commands/discover';
 import { AlertTriangle, CheckCircle, ChevronDown, Info, Sparkles } from 'lucide-react';
 import { DEFAULT_HTTP_TARGET, useRedTeamConfig } from '../hooks/useRedTeamConfig';
+import { useRedTeamTargetConfigValidation } from '../hooks/useRedTeamTargetConfigValidation';
 import PageWrapper from './PageWrapper';
+import { normalizeLocalProviders } from './Targets/helpers';
 
 import type { ApplicationDefinition } from '../types';
 
@@ -81,6 +83,7 @@ function DiscoveryResult({
  */
 export default function Purpose({ onNext, onBack }: PromptsProps) {
   const { config, updateApplicationDefinition } = useRedTeamConfig();
+  const { targetConfigError } = useRedTeamTargetConfigValidation();
   const { recordEvent } = useTelemetry();
   const {
     data: { status: apiHealthStatus },
@@ -160,6 +163,11 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional
   const handleTargetPurposeDiscovery = React.useCallback(async () => {
+    if (targetConfigError) {
+      setDiscoveryError(targetConfigError);
+      return;
+    }
+
     recordEvent('feature_used', { feature: 'redteam_config_target_test' });
     try {
       setIsDiscovering(true);
@@ -173,7 +181,7 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
       const response = await callApi('/providers/discover', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config.target),
+        body: JSON.stringify(normalizeLocalProviders(config.target, { forRuntime: true })),
       });
 
       if (!response.ok) {
@@ -194,7 +202,7 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
       setIsDiscovering(false);
       setShowSlowDiscoveryMessage(false);
     }
-  }, [config.target]);
+  }, [config.target, targetConfigError]);
 
   const hasTargetConfigured = JSON.stringify(config.target) !== JSON.stringify(DEFAULT_HTTP_TARGET);
 
@@ -334,6 +342,7 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                     <Button
                       disabled={
                         !hasTargetConfigured ||
+                        Boolean(targetConfigError) ||
                         apiHealthStatus !== 'connected' ||
                         !!discoveryError ||
                         !!discoveryResult ||
@@ -377,7 +386,15 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                         </AlertContent>
                       </Alert>
                     )}
-                    {discoveryError && (
+                    {targetConfigError && (
+                      <Alert variant="destructive">
+                        <AlertTriangle className="size-4" />
+                        <AlertContent>
+                          <AlertDescription>{targetConfigError}</AlertDescription>
+                        </AlertContent>
+                      </Alert>
+                    )}
+                    {discoveryError && !targetConfigError && (
                       <>
                         <Alert variant="destructive">
                           <AlertTriangle className="size-4" />
@@ -454,9 +471,9 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                   onOpenChange={() => handleSectionToggle('Core Application Details')}
                   className="rounded-t-lg border border-border"
                 >
-                  <CollapsibleTrigger className="flex w-full items-center justify-between p-4 hover:bg-muted/50">
-                    <div className="flex items-center gap-3">
-                      <h3 className="text-base font-semibold tracking-tight">
+                  <CollapsibleTrigger className="flex w-full items-center justify-between gap-3 p-4 hover:bg-muted/50">
+                    <div className="flex min-w-0 flex-1 flex-col items-start gap-1 pr-3 text-left sm:flex-row sm:items-center sm:gap-3">
+                      <h3 className="text-left text-base font-semibold tracking-tight">
                         Core Application Details
                       </h3>
                       <span className="text-xs font-medium text-muted-foreground">
@@ -468,7 +485,7 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                     </div>
                     <ChevronDown
                       className={cn(
-                        'size-5 transition-transform',
+                        'size-5 shrink-0 transition-transform',
                         expandedSections.has('Core Application Details') && 'rotate-180',
                       )}
                     />
@@ -552,9 +569,9 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                   onOpenChange={() => handleSectionToggle('Access & Permissions')}
                   className="border-x border-b border-border"
                 >
-                  <CollapsibleTrigger className="flex w-full items-center justify-between p-4 hover:bg-muted/50">
-                    <div className="flex items-center gap-3">
-                      <h3 className="text-base font-semibold tracking-tight">
+                  <CollapsibleTrigger className="flex w-full items-center justify-between gap-3 p-4 hover:bg-muted/50">
+                    <div className="flex min-w-0 flex-1 flex-col items-start gap-1 pr-3 text-left sm:flex-row sm:items-center sm:gap-3">
+                      <h3 className="text-left text-base font-semibold tracking-tight">
                         Access & Permissions
                       </h3>
                       <span className="text-xs font-medium text-muted-foreground">
@@ -566,7 +583,7 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                     </div>
                     <ChevronDown
                       className={cn(
-                        'size-5 transition-transform',
+                        'size-5 shrink-0 transition-transform',
                         expandedSections.has('Access & Permissions') && 'rotate-180',
                       )}
                     />
@@ -669,9 +686,11 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                   onOpenChange={() => handleSectionToggle('Data & Content')}
                   className="border-x border-b border-border"
                 >
-                  <CollapsibleTrigger className="flex w-full items-center justify-between p-4 hover:bg-muted/50">
-                    <div className="flex items-center gap-3">
-                      <h3 className="text-base font-semibold tracking-tight">Data & Content</h3>
+                  <CollapsibleTrigger className="flex w-full items-center justify-between gap-3 p-4 hover:bg-muted/50">
+                    <div className="flex min-w-0 flex-1 flex-col items-start gap-1 pr-3 text-left sm:flex-row sm:items-center sm:gap-3">
+                      <h3 className="text-left text-base font-semibold tracking-tight">
+                        Data & Content
+                      </h3>
                       <span className="text-xs font-medium text-muted-foreground">
                         {getCompletionPercentage('Data & Content')}
                       </span>
@@ -681,7 +700,7 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                     </div>
                     <ChevronDown
                       className={cn(
-                        'size-5 transition-transform',
+                        'size-5 shrink-0 transition-transform',
                         expandedSections.has('Data & Content') && 'rotate-180',
                       )}
                     />
@@ -783,9 +802,11 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                   onOpenChange={() => handleSectionToggle('Business Context')}
                   className="rounded-b-lg border-x border-b border-border"
                 >
-                  <CollapsibleTrigger className="flex w-full items-center justify-between p-4 hover:bg-muted/50">
-                    <div className="flex items-center gap-3">
-                      <h3 className="text-base font-semibold tracking-tight">Business Context</h3>
+                  <CollapsibleTrigger className="flex w-full items-center justify-between gap-3 p-4 hover:bg-muted/50">
+                    <div className="flex min-w-0 flex-1 flex-col items-start gap-1 pr-3 text-left sm:flex-row sm:items-center sm:gap-3">
+                      <h3 className="text-left text-base font-semibold tracking-tight">
+                        Business Context
+                      </h3>
                       <span className="text-xs font-medium text-muted-foreground">
                         {getCompletionPercentage('Business Context')}
                       </span>
@@ -795,7 +816,7 @@ export default function Purpose({ onNext, onBack }: PromptsProps) {
                     </div>
                     <ChevronDown
                       className={cn(
-                        'size-5 transition-transform',
+                        'size-5 shrink-0 transition-transform',
                         expandedSections.has('Business Context') && 'rotate-180',
                       )}
                     />

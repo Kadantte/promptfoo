@@ -1,8 +1,8 @@
 import { render, screen, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { describe, expect, it } from 'vitest';
 import History from './History';
-import type { StandaloneEval } from '@promptfoo/util/database';
+import type { StandaloneEval } from '@promptfoo/types/standaloneEval';
 
 const mockData: StandaloneEval[] = [
   {
@@ -84,6 +84,8 @@ describe('History', () => {
     const row1Cells = within(row1);
     const evalLink1 = row1Cells.getByRole('link', { name: 'eval-2024-01-01' });
     expect(evalLink1).toHaveAttribute('href', '/eval/eval-2024-01-01');
+    expect(evalLink1).toHaveAttribute('title', 'eval-2024-01-01');
+    expect(evalLink1).toHaveClass('truncate');
     const datasetLink1 = row1Cells.getByRole('link', { name: 'alpha-' });
     expect(datasetLink1).toHaveAttribute('href', '/datasets?id=alpha-dataset');
     expect(row1Cells.getByText('TestProviderA')).toBeInTheDocument();

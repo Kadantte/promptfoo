@@ -1,23 +1,28 @@
 import logger from '../../logger';
+import { isCallerAbortError } from '../../util/fetch/requestSignal';
+import { preserveResponseHeadersObserverErrorResponse } from '../../util/fetch/responseHeadersObserver';
 import { renderVarsInObject } from '../../util/index';
 import invariant from '../../util/invariant';
-import { OpenAiChatCompletionProvider } from '../openai/chat';
+import { type OpenAiChatCompletionCostData, OpenAiChatCompletionProvider } from '../openai/chat';
+import { serializeProvider } from '../serialization';
+import {
+  clampCachedTokens,
+  getOpenAIChatOutputLimitFromEnv,
+  resolveDirectTestVariable,
+  throwIfAborted,
+} from '../shared';
 
 import type { ApiProvider, ProviderOptions } from '../../types/index';
 import type { OpenAiCompletionOptions } from '../openai/types';
 
 /**
- * xAI Agent Tools API - Server-side tool types
+ * xAI Agent Tools API - server-side tool types.
  *
- * TODO: These interfaces are defined for future use when the xAI Responses API
- * is supported. Currently, Agent Tools (web_search, x_search, code_execution,
- * collections_search, mcp) require the Responses API endpoint which is different
- * from the Chat Completions API we currently use.
+ * Agent tools run through the Responses API. This chat-completions provider keeps
+ * support for legacy `search_parameters`; new tool-enabled configs should use
+ * `xai:responses:<model>` instead.
  *
- * For now, use `search_parameters` (Live Search) for real-time web/X search,
- * which works with the Chat Completions API.
- *
- * See: https://docs.x.ai/docs/tools/overview
+ * See: https://docs.x.ai/developers/tools/overview
  */
 export interface XAIWebSearchTool {
   type: 'web_search';
@@ -76,13 +81,51 @@ export type XAIAgentTool =
   | XAICollectionsSearchTool
   | XAIMCPTool;
 
-type XAIConfig = {
+export interface XAICostConfig {
+  /** Custom per-token cost override for both input and output tokens. */
+  cost?: number;
+  /** Custom per-token input cost override. Takes precedence over cost. */
+  inputCost?: number;
+  /** Custom per-token output cost override. Takes precedence over cost. */
+  outputCost?: number;
+  /** Custom per-token cost for prompt tokens served from xAI's prompt cache. */
+  cacheReadCost?: number;
+}
+
+type XAIModelCost = {
+  input: number;
+  output: number;
+  cache_read?: number;
+  longContext?: {
+    threshold: number;
+    input: number;
+    output: number;
+    cache_read?: number;
+  };
+};
+
+type XAIModel = {
+  id: string;
+  cost: XAIModelCost;
+  aliases?: string[];
+};
+
+export type XAIServiceTier = 'default' | 'priority';
+
+export function assertXAIServiceTier(serviceTier: unknown): void {
+  if (serviceTier !== undefined && serviceTier !== 'default' && serviceTier !== 'priority') {
+    throw new Error('Invalid xAI service_tier. Use "default" or "priority".');
+  }
+}
+
+type XAIConfig = Omit<OpenAiCompletionOptions, 'service_tier'> & {
   region?: string;
-  reasoning_effort?: 'low' | 'high';
+  reasoning_effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh';
+  service_tier?: XAIServiceTier;
   search_parameters?: Record<string, any>;
   /** xAI Agent Tools - server-side tools for agentic workflows */
   agent_tools?: XAIAgentTool[];
-} & OpenAiCompletionOptions;
+} & XAICostConfig;
 
 type XAIProviderOptions = Omit<ProviderOptions, 'config'> & {
   config?: {
@@ -90,136 +133,275 @@ type XAIProviderOptions = Omit<ProviderOptions, 'config'> & {
   };
 };
 
-export const XAI_CHAT_MODELS = [
-  // Grok 4.1 Fast Models (2M context window)
+// Pricing is sourced from https://docs.x.ai/developers/pricing. Response billing
+// uses the same $1e-10 scale in `usage.cost_in_usd_ticks`.
+const GROK_43_AND_420_LONG_CONTEXT_COST = {
+  threshold: 200_000,
+  input: 2.5 / 1e6,
+  output: 5 / 1e6,
+  cache_read: 0.4 / 1e6,
+};
+
+export const XAI_CHAT_MODELS: XAIModel[] = [
+  ...modelsWithCost(
+    [
+      // Grok 4.7 (500K context): https://docs.x.ai/developers/release-notes
+      { id: 'grok-4.7' },
+      // Grok 4.6 Models (500K context).
+      // xAI publishes no aliases for this id — `grok-4.6-latest` 404s on
+      // /v1/language-models — so none are listed here.
+      { id: 'grok-4.6' },
+    ],
+    {
+      input: 2.0 / 1e6,
+      output: 6.0 / 1e6,
+      cache_read: 0.5 / 1e6,
+      longContext: {
+        threshold: 200_000,
+        input: 4.0 / 1e6,
+        output: 12.0 / 1e6,
+        cache_read: 1.0 / 1e6,
+      },
+    },
+  ),
+  // Grok 4.5 Models (500K context)
   {
-    id: 'grok-4-1-fast-reasoning',
+    id: 'grok-4.5',
     cost: {
+      input: 2.0 / 1e6,
+      output: 6.0 / 1e6,
+      // Verified live 2026-08-31 against usage.cost_in_usd_ticks on a cache hit:
+      // grok-4.5 reads cached prompt tokens at $0.30/1M, not $0.50/1M. The
+      // $0.50 rate belongs to grok-4.6.
+      cache_read: 0.3 / 1e6,
+      longContext: {
+        threshold: 200_000,
+        input: 4.0 / 1e6,
+        output: 12.0 / 1e6,
+        cache_read: 0.6 / 1e6,
+      },
+    },
+    aliases: ['grok-4.5-latest', 'grok-build-latest'],
+  },
+  ...modelsWithCost(
+    [
+      // Grok 4.20 Models
+      {
+        id: 'grok-4.20-0309-reasoning',
+        aliases: [
+          'grok-4.20',
+          'grok-4.20-reasoning',
+          'grok-4.20-reasoning-latest',
+          'grok-4.20-0309',
+          'grok-4.20-beta',
+          'grok-4.20-beta-0309',
+          'grok-4.20-beta-0309-reasoning',
+          'grok-4.20-beta-latest',
+          'grok-4.20-beta-latest-reasoning',
+          'grok-4.20-beta-reasoning',
+          'grok-4.20-experimental-beta-0304',
+          'grok-4.20-experimental-beta-0304-reasoning',
+          'grok-4.20-experimental-beta-latest',
+          'grok-4.20-experimental-beta-reasoning-latest',
+          'grok-4.20-reasoning-gv2',
+        ],
+      },
+      {
+        id: 'grok-4.20-0309-non-reasoning',
+        aliases: [
+          'grok-4.20-non-reasoning',
+          'grok-4.20-non-reasoning-latest',
+          'grok-4.20-beta-non-reasoning',
+          'grok-4.20-beta-latest-non-reasoning',
+          'grok-4.20-beta-0309-non-reasoning',
+          'grok-4.20-experimental-beta-0304-non-reasoning',
+          'grok-4.20-experimental-beta-non-reasoning-latest',
+          'grok-4.20-non-reasoning-gv2',
+        ],
+      },
+      {
+        id: 'grok-4.20-multi-agent-0309',
+        aliases: [
+          'grok-4.20-multi-agent',
+          'grok-4.20-multi-agent-latest',
+          'grok-4.20-multi-agent-beta-latest',
+          'grok-4.20-multi-agent-beta-0309',
+          'grok-4.20-multi-agent-experimental-beta-0304',
+          'grok-4.20-multi-agent-experimental-beta-latest',
+        ],
+      },
+      // Grok 4.3 Models
+      {
+        id: 'grok-4.3',
+        aliases: ['grok-4.3-latest', 'grok-latest'],
+      },
+    ],
+    {
+      input: 1.25 / 1e6,
+      output: 2.5 / 1e6,
+      cache_read: 0.2 / 1e6,
+      longContext: GROK_43_AND_420_LONG_CONTEXT_COST,
+    },
+  ),
+  ...modelsWithCost(
+    [
+      // Grok 4.1 Fast Models (2M context window)
+      {
+        id: 'grok-4-1-fast-reasoning',
+        aliases: ['grok-4-1-fast', 'grok-4-1-fast-latest', 'grok-4-1-fast-reasoning-latest'],
+      },
+      {
+        id: 'grok-4-1-fast-non-reasoning',
+        aliases: ['grok-4-1-fast-non-reasoning-latest'],
+      },
+    ],
+    {
       input: 0.2 / 1e6,
       output: 0.5 / 1e6,
       cache_read: 0.05 / 1e6,
     },
-    aliases: ['grok-4-1-fast', 'grok-4-1-fast-latest'],
-  },
+  ),
+  // Grok Build Models
   {
-    id: 'grok-4-1-fast-non-reasoning',
+    id: 'grok-build-0.1',
     cost: {
+      input: 1.0 / 1e6,
+      output: 2.0 / 1e6,
+      cache_read: 0.2 / 1e6,
+      longContext: {
+        threshold: 200_000,
+        input: 2.0 / 1e6,
+        output: 4.0 / 1e6,
+        cache_read: 0.4 / 1e6,
+      },
+    },
+    aliases: ['grok-code-fast-1', 'grok-code-fast', 'grok-code-fast-1-0825'],
+  },
+  ...modelsWithCost(
+    [
+      // Grok-4 Fast Models (2M context window)
+      {
+        id: 'grok-4-fast-reasoning',
+        aliases: ['grok-4-fast', 'grok-4-fast-latest', 'grok-4-fast-reasoning-latest'],
+      },
+      {
+        id: 'grok-4-fast-non-reasoning',
+        aliases: ['grok-4-fast-non-reasoning-latest'],
+      },
+    ],
+    {
       input: 0.2 / 1e6,
       output: 0.5 / 1e6,
       cache_read: 0.05 / 1e6,
     },
-  },
-  // Grok Code Fast Models
-  {
-    id: 'grok-code-fast-1',
-    cost: {
-      input: 0.2 / 1e6,
-      output: 1.5 / 1e6,
-      cache_read: 0.02 / 1e6,
-    },
-    aliases: ['grok-code-fast'],
-  },
-  {
-    id: 'grok-code-fast-1-0825',
-    cost: {
-      input: 0.2 / 1e6,
-      output: 1.5 / 1e6,
-      cache_read: 0.02 / 1e6,
-    },
-  },
-  // Grok-4 Fast Models (2M context window)
-  {
-    id: 'grok-4-fast-reasoning',
-    cost: {
-      input: 0.2 / 1e6,
-      output: 0.5 / 1e6,
-      cache_read: 0.05 / 1e6,
-    },
-    aliases: ['grok-4-fast', 'grok-4-fast-latest'],
-  },
-  {
-    id: 'grok-4-fast-non-reasoning',
-    cost: {
-      input: 0.2 / 1e6,
-      output: 0.5 / 1e6,
-      cache_read: 0.05 / 1e6,
-    },
-  },
-  // Grok-4 Models
-  {
-    id: 'grok-4-0709',
-    cost: {
+  ),
+  ...modelsWithCost(
+    [
+      // Grok-4 Models
+      {
+        id: 'grok-4-0709',
+        aliases: ['grok-4', 'grok-4-latest'],
+      },
+      // Grok-3 Models
+      {
+        id: 'grok-3-beta',
+        aliases: ['grok-3', 'grok-3-latest'],
+      },
+      {
+        id: 'grok-3-fast-beta',
+        aliases: ['grok-3-fast', 'grok-3-fast-latest'],
+      },
+    ],
+    {
       input: 3.0 / 1e6,
       output: 15.0 / 1e6,
+      cache_read: 0.75 / 1e6,
     },
-    aliases: ['grok-4', 'grok-4-latest'],
-  },
-  // Grok-3 Models
-  {
-    id: 'grok-3-beta',
-    cost: {
-      input: 3.0 / 1e6,
-      output: 15.0 / 1e6,
-    },
-    aliases: ['grok-3', 'grok-3-latest'],
-  },
-  {
-    id: 'grok-3-fast-beta',
-    cost: {
-      input: 5.0 / 1e6,
-      output: 25.0 / 1e6,
-    },
-    aliases: ['grok-3-fast', 'grok-3-fast-latest'],
-  },
-  {
-    id: 'grok-3-mini-beta',
-    cost: {
+  ),
+  ...modelsWithCost(
+    [
+      {
+        id: 'grok-3-mini-beta',
+        aliases: ['grok-3-mini', 'grok-3-mini-latest'],
+      },
+      {
+        id: 'grok-3-mini-fast-beta',
+        aliases: ['grok-3-mini-fast', 'grok-3-mini-fast-latest'],
+      },
+    ],
+    {
       input: 0.3 / 1e6,
       output: 0.5 / 1e6,
+      cache_read: 0.075 / 1e6,
     },
-    aliases: ['grok-3-mini', 'grok-3-mini-latest'],
-  },
-  {
-    id: 'grok-3-mini-fast-beta',
-    cost: {
-      input: 0.6 / 1e6,
-      output: 4.0 / 1e6,
-    },
-    aliases: ['grok-3-mini-fast', 'grok-3-mini-fast-latest'],
-  },
-  // Grok-2 Models
-  {
-    id: 'grok-2-1212',
-    cost: {
+  ),
+  ...modelsWithCost(
+    [
+      // Grok-2 Models
+      {
+        id: 'grok-2-1212',
+        aliases: ['grok-2', 'grok-2-latest'],
+      },
+      {
+        id: 'grok-2-vision-1212',
+        aliases: ['grok-2-vision', 'grok-2-vision-latest'],
+      },
+    ],
+    {
       input: 2.0 / 1e6,
       output: 10.0 / 1e6,
     },
-    aliases: ['grok-2', 'grok-2-latest'],
-  },
-  {
-    id: 'grok-2-vision-1212',
-    cost: {
-      input: 2.0 / 1e6,
-      output: 10.0 / 1e6,
-    },
-    aliases: ['grok-2-vision', 'grok-2-vision-latest'],
-  },
-  // Legacy models
-  {
-    id: 'grok-beta',
-    cost: {
+  ),
+  ...modelsWithCost(
+    [
+      // Legacy models
+      { id: 'grok-beta' },
+      { id: 'grok-vision-beta' },
+    ],
+    {
       input: 5.0 / 1e6,
       output: 15.0 / 1e6,
     },
-  },
-  {
-    id: 'grok-vision-beta',
-    cost: {
-      input: 5.0 / 1e6,
-      output: 15.0 / 1e6,
-    },
-  },
+  ),
 ];
+
+// xAI's May 15, 2026 migration guide confirms the following behaviour for the
+// listed legacy chat slugs: requests continue to work after
+// the cutoff but redirect to grok-4.3 (low reasoning effort for the reasoning
+// variants, none for the non-reasoning variants) and are billed at standard
+// grok-4.3 pricing ($1.25 / 1M input, $2.50 / 1M output). The set mirrors
+// the retired model families that share that target. Grok Code Fast is excluded:
+// its aliases route to Grok Build 0.1 instead.
+const GROK_43_REDIRECTED_CHAT_MODELS = new Set([
+  // grok-4-1-fast-{reasoning,non-reasoning} family
+  'grok-4-1-fast-reasoning',
+  'grok-4-1-fast-non-reasoning',
+  'grok-4-1-fast',
+  'grok-4-1-fast-latest',
+  'grok-4-1-fast-reasoning-latest',
+  'grok-4-1-fast-non-reasoning-latest',
+  // grok-4-fast-{reasoning,non-reasoning} family
+  'grok-4-fast-reasoning',
+  'grok-4-fast-non-reasoning',
+  'grok-4-fast',
+  'grok-4-fast-latest',
+  'grok-4-fast-reasoning-latest',
+  'grok-4-fast-non-reasoning-latest',
+  // grok-4 (0709) family
+  'grok-4-0709',
+  'grok-4',
+  'grok-4-latest',
+  // NOTE: the grok-code-fast family is NOT redirected here — xAI's current docs
+  // list those slugs as aliases of grok-build-0.1, which has its own pricing.
+  // grok-3 family — xAI's catalog collapses every -beta/-fast variant into
+  // the same id, so they all share the post-retirement billing target.
+  'grok-3',
+  'grok-3-latest',
+  'grok-3-beta',
+  'grok-3-fast',
+  'grok-3-fast-latest',
+  'grok-3-fast-beta',
+]);
 
 export const GROK_3_MINI_MODELS = [
   'grok-3-mini-beta',
@@ -230,8 +412,17 @@ export const GROK_3_MINI_MODELS = [
   'grok-3-mini-fast-latest',
 ];
 
-// Models that support reasoning_effort parameter (only Grok-3 mini models)
+// Models that support reasoning_effort on the chat-completions-compatible API.
+// Grok 4.6 and 4.7 additionally support `xhigh`; Grok 4.3 accepts `none`.
 export const GROK_REASONING_EFFORT_MODELS = [
+  'grok-4.7',
+  'grok-4.6',
+  'grok-4.5',
+  'grok-4.5-latest',
+  'grok-build-latest',
+  'grok-4.3',
+  'grok-4.3-latest',
+  'grok-latest',
   'grok-3-mini-beta',
   'grok-3-mini',
   'grok-3-mini-latest',
@@ -240,13 +431,108 @@ export const GROK_REASONING_EFFORT_MODELS = [
   'grok-3-mini-fast-latest',
 ];
 
-// All reasoning models (including Grok-4 which doesn't support reasoning_effort)
+// Grok 4.5 and newer models cannot disable reasoning. Keep the original export name.
+export const GROK_45_MODELS: ReadonlySet<string> = new Set([
+  'grok-4.7',
+  'grok-4.6',
+  'grok-4.5',
+  'grok-4.5-latest',
+  'grok-build-latest',
+]);
+
+export class XAIRequestConfigError extends Error {}
+
+export function validateXAIReasoningEffort(
+  modelName: string,
+  effort: unknown,
+  parameter: 'reasoning_effort' | 'reasoning.effort',
+): void {
+  const supportsNone = ['grok-4.3', 'grok-4.3-latest', 'grok-latest'].includes(modelName);
+  if ((!GROK_45_MODELS.has(modelName) && !supportsNone) || effort === undefined) {
+    return;
+  }
+
+  const supportsXHigh = modelName === 'grok-4.7' || modelName === 'grok-4.6';
+  const allowed = supportsXHigh
+    ? ['low', 'medium', 'high', 'xhigh']
+    : supportsNone
+      ? ['none', 'low', 'medium', 'high']
+      : ['low', 'medium', 'high'];
+  if (typeof effort !== 'string' || !allowed.includes(effort)) {
+    const choices = supportsXHigh
+      ? '"low", "medium", "high", or "xhigh"'
+      : supportsNone
+        ? '"none", "low", "medium", or "high"'
+        : '"low", "medium", or "high"';
+    const guidance = supportsNone
+      ? `Use ${choices}, or omit ${parameter}.`
+      : `Use ${choices}, or omit ${parameter} to use the default "high".`;
+    throw new XAIRequestConfigError(
+      `xAI model ${modelName} does not support ${parameter} with the supplied value. ${guidance}`,
+    );
+  }
+}
+
+export function resolveGrok47ReasoningEffort(
+  value: unknown,
+  vars?: Record<string, unknown>,
+): string | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  value = resolveDirectTestVariable(value, vars);
+  if (typeof value === 'string' && ['none', 'low', 'medium', 'high', 'xhigh'].includes(value)) {
+    return value;
+  }
+  throw new XAIRequestConfigError(
+    'xAI Grok 4.7 reasoning effort must be a supported value or a simple test variable',
+  );
+}
+
+// All reasoning models, including older families that reason without a tunable effort knob.
 export const GROK_REASONING_MODELS = [
+  // Grok 4.7
+  'grok-4.7',
+  // Grok 4.6
+  'grok-4.6',
+  // Grok 4.5
+  'grok-4.5',
+  'grok-4.5-latest',
+  'grok-build-latest',
+  // Grok 4.20
+  'grok-4.20-0309-reasoning',
+  'grok-4.20-reasoning',
+  'grok-4.20',
+  'grok-4.20-reasoning-latest',
+  'grok-4.20-0309',
+  'grok-4.20-beta',
+  'grok-4.20-beta-0309',
+  'grok-4.20-beta-0309-reasoning',
+  'grok-4.20-beta-latest',
+  'grok-4.20-beta-latest-reasoning',
+  'grok-4.20-beta-reasoning',
+  'grok-4.20-experimental-beta-0304',
+  'grok-4.20-experimental-beta-0304-reasoning',
+  'grok-4.20-experimental-beta-latest',
+  'grok-4.20-experimental-beta-reasoning-latest',
+  'grok-4.20-reasoning-gv2',
+  'grok-4.20-multi-agent-0309',
+  'grok-4.20-multi-agent',
+  'grok-4.20-multi-agent-latest',
+  'grok-4.20-multi-agent-beta-latest',
+  'grok-4.20-multi-agent-beta-0309',
+  'grok-4.20-multi-agent-experimental-beta-0304',
+  'grok-4.20-multi-agent-experimental-beta-latest',
+  // Grok 4.3
+  'grok-4.3',
+  'grok-4.3-latest',
+  'grok-latest',
   // Grok 4.1 Fast reasoning
   'grok-4-1-fast-reasoning',
   'grok-4-1-fast',
   'grok-4-1-fast-latest',
-  // Grok Code Fast
+  'grok-4-1-fast-reasoning-latest',
+  'grok-build-0.1',
   'grok-code-fast-1',
   'grok-code-fast',
   'grok-code-fast-1-0825',
@@ -254,6 +540,7 @@ export const GROK_REASONING_MODELS = [
   'grok-4-fast-reasoning',
   'grok-4-fast',
   'grok-4-fast-latest',
+  'grok-4-fast-reasoning-latest',
   // Grok 4
   'grok-4-0709',
   'grok-4',
@@ -267,18 +554,79 @@ export const GROK_REASONING_MODELS = [
   'grok-3-mini-fast-latest',
 ];
 
-// Grok-4+ models that have specific parameter restrictions (no presence_penalty, frequency_penalty, stop, reasoning_effort)
+const GROK_BUILD_CHAT_MODELS = new Set([
+  'grok-build-0.1',
+  'grok-code-fast-1',
+  'grok-code-fast',
+  'grok-code-fast-1-0825',
+]);
+
+// Grok-4+ models that have specific sampling-parameter restrictions.
 export const GROK_4_MODELS = [
+  // Grok 4.7 rejects presence_penalty, frequency_penalty, and stop.
+  'grok-4.7',
+  // Grok 4.6 (rejects presence_penalty, frequency_penalty, and stop; verified live 2026-08-31)
+  'grok-4.6',
+  // Grok 4.5 (rejects presence_penalty, frequency_penalty, and stop; verified live 2026-07-09)
+  'grok-4.5',
+  'grok-4.5-latest',
+  'grok-build-latest',
+  // Grok 4.20
+  'grok-4.20-0309-reasoning',
+  'grok-4.20-reasoning',
+  'grok-4.20',
+  'grok-4.20-reasoning-latest',
+  'grok-4.20-0309',
+  'grok-4.20-beta',
+  'grok-4.20-beta-0309',
+  'grok-4.20-beta-0309-reasoning',
+  'grok-4.20-beta-latest',
+  'grok-4.20-beta-latest-reasoning',
+  'grok-4.20-beta-reasoning',
+  'grok-4.20-experimental-beta-0304',
+  'grok-4.20-experimental-beta-0304-reasoning',
+  'grok-4.20-experimental-beta-latest',
+  'grok-4.20-experimental-beta-reasoning-latest',
+  'grok-4.20-reasoning-gv2',
+  'grok-4.20-0309-non-reasoning',
+  'grok-4.20-non-reasoning',
+  'grok-4.20-non-reasoning-latest',
+  'grok-4.20-beta-non-reasoning',
+  'grok-4.20-beta-latest-non-reasoning',
+  'grok-4.20-beta-0309-non-reasoning',
+  'grok-4.20-experimental-beta-0304-non-reasoning',
+  'grok-4.20-experimental-beta-non-reasoning-latest',
+  'grok-4.20-non-reasoning-gv2',
+  'grok-4.20-multi-agent-0309',
+  'grok-4.20-multi-agent',
+  'grok-4.20-multi-agent-latest',
+  'grok-4.20-multi-agent-beta-latest',
+  'grok-4.20-multi-agent-beta-0309',
+  'grok-4.20-multi-agent-experimental-beta-0304',
+  'grok-4.20-multi-agent-experimental-beta-latest',
+  // Grok 4.3
+  'grok-4.3',
+  'grok-4.3-latest',
+  'grok-latest',
   // Grok 4.1 Fast
   'grok-4-1-fast-reasoning',
   'grok-4-1-fast',
   'grok-4-1-fast-latest',
+  'grok-4-1-fast-reasoning-latest',
   'grok-4-1-fast-non-reasoning',
+  'grok-4-1-fast-non-reasoning-latest',
+  // Grok Build and retired Grok Code Fast aliases
+  'grok-build-0.1',
+  'grok-code-fast-1',
+  'grok-code-fast',
+  'grok-code-fast-1-0825',
   // Grok 4 Fast
   'grok-4-fast-reasoning',
   'grok-4-fast',
   'grok-4-fast-latest',
+  'grok-4-fast-reasoning-latest',
   'grok-4-fast-non-reasoning',
+  'grok-4-fast-non-reasoning-latest',
   // Grok 4
   'grok-4-0709',
   'grok-4',
@@ -290,27 +638,89 @@ export const GROK_4_MODELS = [
  */
 export function calculateXAICost(
   modelName: string,
-  config: any,
+  config: XAICostConfig,
   promptTokens?: number,
   completionTokens?: number,
   reasoningTokens?: number,
+  cachedTokens?: number,
+  options?: {
+    /** Grok 4.7 and 4.6 catalog prices are 10% higher on the official US endpoint. */
+    apiUrl?: string;
+    /**
+     * Set when `completion_tokens` EXCLUDES reasoning tokens, so reasoning must be
+     * billed on top at the output rate. xAI's chat-completions endpoint reports
+     * tokens this way (total_tokens = prompt + completion + reasoning) and bills
+     * reasoning at the output rate — verified live against `usage.cost_in_usd_ticks`
+     * for grok-4.5, grok-4.3, grok-4.20, and grok-build-0.1 on 2026-07-09. The
+     * Responses API keeps the OpenAI convention (`output_tokens` includes
+     * reasoning), so it must NOT set this flag or reasoning is double-counted.
+     */
+    reasoningBilledSeparately?: boolean;
+    /** The response-confirmed processing tier. Priority processing doubles catalog token rates. */
+    serviceTier?: XAIServiceTier;
+  },
 ): number | undefined {
-  if (!promptTokens || !completionTokens) {
+  const completion = completionTokens ?? 0;
+  // Default (Responses API / OpenAI convention): completion tokens already include
+  // reasoning tokens; bill completion at the output rate and fall back to reasoning
+  // tokens only for a reasoning-only turn so it is not billed as free.
+  const billableOutputTokens = options?.reasoningBilledSeparately
+    ? completion + (reasoningTokens ?? 0)
+    : completion > 0
+      ? completion
+      : (reasoningTokens ?? 0);
+  if (
+    promptTokens == null ||
+    billableOutputTokens < 0 ||
+    (promptTokens <= 0 && billableOutputTokens === 0)
+  ) {
     return undefined;
   }
 
-  const model = XAI_CHAT_MODELS.find(
-    (m) => m.id === modelName || (m.aliases && m.aliases.includes(modelName)),
-  );
-  if (!model || !model.cost) {
+  const model = GROK_43_REDIRECTED_CHAT_MODELS.has(modelName)
+    ? XAI_CHAT_MODELS.find((m) => m.id === 'grok-4.3')
+    : XAI_CHAT_MODELS.find(
+        (m) => m.id === modelName || (m.aliases && m.aliases.includes(modelName)),
+      );
+  const inputCostOverride = config.inputCost ?? config.cost;
+  // xAI's language-model REST schema defines long_context_threshold as the token
+  // count "at or above" which long-context prices apply.
+  const modelCost =
+    model?.cost?.longContext && promptTokens >= model.cost.longContext.threshold
+      ? model.cost.longContext
+      : model?.cost;
+  const regionMultiplier =
+    (model?.id === 'grok-4.7' || model?.id === 'grok-4.6') &&
+    options?.apiUrl &&
+    URL.canParse(options.apiUrl) &&
+    new URL(options.apiUrl).origin === 'https://us.api.x.ai'
+      ? 1.1
+      : 1;
+  const catalogMultiplier = regionMultiplier * (options?.serviceTier === 'priority' ? 2 : 1);
+  const inputCost = inputCostOverride ?? (modelCost && modelCost.input * catalogMultiplier);
+  const outputCost =
+    config.outputCost ?? config.cost ?? (modelCost && modelCost.output * catalogMultiplier);
+  const cacheReadCost =
+    config.cacheReadCost ??
+    inputCostOverride ??
+    (modelCost?.cache_read === undefined ? inputCost : modelCost.cache_read * catalogMultiplier);
+
+  const billableCachedTokens = clampCachedTokens(cachedTokens, promptTokens);
+  const uncachedPromptTokens = promptTokens - billableCachedTokens;
+  if (
+    (uncachedPromptTokens > 0 && inputCost === undefined) ||
+    (billableCachedTokens > 0 && cacheReadCost === undefined) ||
+    (billableOutputTokens > 0 && outputCost === undefined)
+  ) {
     return undefined;
   }
 
-  const inputCost = config.inputCost ?? config.cost ?? model.cost.input;
-  const outputCost = config.outputCost ?? config.cost ?? model.cost.output;
-
-  const inputCostTotal = inputCost * promptTokens;
-  const outputCostTotal = outputCost * completionTokens;
+  // Cached prompt tokens (prompt_tokens_details.cached_tokens) use the reduced
+  // cache-read rate. When no cache rate is known, cacheReadCost falls back to the
+  // full input rate so this formula preserves the undiscounted behavior.
+  const inputCostTotal =
+    (inputCost ?? 0) * uncachedPromptTokens + (cacheReadCost ?? 0) * billableCachedTokens;
+  const outputCostTotal = (outputCost ?? 0) * billableOutputTokens;
 
   logger.debug(
     `XAI cost calculation for ${modelName}: ` +
@@ -320,6 +730,82 @@ export function calculateXAICost(
   );
 
   return inputCostTotal + outputCostTotal;
+}
+
+export function getXAICostInUsd(usage?: { cost_in_usd_ticks?: number }): number | undefined {
+  if (
+    typeof usage?.cost_in_usd_ticks !== 'number' ||
+    !Number.isFinite(usage.cost_in_usd_ticks) ||
+    usage.cost_in_usd_ticks < 0
+  ) {
+    return undefined;
+  }
+
+  return usage.cost_in_usd_ticks / 1e10;
+}
+
+export function hasXAICostOverrides(config?: XAICostConfig): boolean {
+  return (
+    config?.cost !== undefined ||
+    config?.inputCost !== undefined ||
+    config?.outputCost !== undefined ||
+    config?.cacheReadCost !== undefined
+  );
+}
+
+export function getXAIRequestModel(modelName: string, config?: { passthrough?: object }): string {
+  const model = (config?.passthrough as { model?: unknown } | undefined)?.model;
+  return typeof model === 'string' ? model : modelName;
+}
+
+type XAIRequestOption = 'reasoning' | 'reasoning_effort' | 'max_completion_tokens' | 'max_tokens';
+
+export function getXAIRequestOption(
+  key: XAIRequestOption | readonly XAIRequestOption[],
+  ...scopes: (object | undefined)[]
+): unknown {
+  const keys = typeof key === 'string' ? [key] : key;
+  let passthroughReplaced = false;
+  for (const [index, scope] of scopes.entries()) {
+    const config = scope as Record<string, unknown> | undefined;
+    const raw = passthroughReplaced
+      ? undefined
+      : (config?.passthrough as Record<string, unknown> | undefined);
+    if (
+      index === 0 &&
+      raw &&
+      keys.some((name) => Object.prototype.hasOwnProperty.call(raw, name)) &&
+      keys.some((name) => config && Object.prototype.hasOwnProperty.call(config, name))
+    ) {
+      throw new XAIRequestConfigError(
+        `xAI received ${keys.join('/')} in both test options and test passthrough; use one location`,
+      );
+    }
+    if (config && Object.prototype.hasOwnProperty.call(config, 'passthrough')) {
+      passthroughReplaced = true;
+    }
+    for (const source of [raw, config]) {
+      const availableKeys = keys.filter(
+        (name) => source && Object.prototype.hasOwnProperty.call(source, name),
+      );
+      if (
+        source &&
+        availableKeys.length === 2 &&
+        availableKeys.every((name) => source[name] != null) &&
+        source[availableKeys[0]] !== source[availableKeys[1]]
+      ) {
+        throw new XAIRequestConfigError(
+          'xAI Grok 4.7 received conflicting max_tokens and max_completion_tokens; use one spelling',
+        );
+      }
+      for (const name of availableKeys) {
+        if (source && (keys.length === 1 || source[name] != null)) {
+          return source[name];
+        }
+      }
+    }
+  }
+  return undefined;
 }
 
 class XAIProvider extends OpenAiChatCompletionProvider {
@@ -334,6 +820,9 @@ class XAIProvider extends OpenAiChatCompletionProvider {
   }
 
   protected supportsReasoningEffort(): boolean {
+    // Redirected legacy aliases still reject reasoning_effort under their old
+    // request contract. Strip it for those aliases; users who want to tune
+    // effort should target grok-4.3 directly.
     return GROK_REASONING_EFFORT_MODELS.includes(this.modelName);
   }
 
@@ -342,6 +831,20 @@ class XAIProvider extends OpenAiChatCompletionProvider {
   }
 
   async getOpenAiBody(prompt: string, context?: any, callApiOptions?: any) {
+    const config = { ...this.config, ...context?.prompt?.config };
+    const model = getXAIRequestModel(this.modelName, config);
+    const usesGrok47 = model === 'grok-4.7';
+    const usesPassthroughReasoningModel =
+      typeof config.passthrough?.model === 'string' && GROK_REASONING_MODELS.includes(model);
+    const testOptions = context?.test?.options;
+    let effort: string | undefined;
+    if (usesGrok47) {
+      effort = resolveGrok47ReasoningEffort(
+        getXAIRequestOption('reasoning_effort', testOptions, context?.prompt?.config, this.config),
+        context?.vars,
+      );
+      validateXAIReasoningEffort(model, effort, 'reasoning_effort');
+    }
     const result = await super.getOpenAiBody(prompt, context, callApiOptions);
 
     // Ensure we have a valid result
@@ -349,17 +852,56 @@ class XAIProvider extends OpenAiChatCompletionProvider {
       return result;
     }
 
-    // Filter out unsupported parameters for Grok-4
-    if (this.modelName && GROK_4_MODELS.includes(this.modelName)) {
+    assertXAIServiceTier(result.body.service_tier);
+
+    if (usesGrok47) {
+      if (effort === undefined) {
+        delete result.body.reasoning_effort;
+      } else {
+        Object.assign(result.body, { reasoning_effort: effort });
+      }
+    } else if (usesPassthroughReasoningModel && GROK_REASONING_EFFORT_MODELS.includes(model)) {
+      const configuredEffort = getXAIRequestOption(
+        'reasoning_effort',
+        testOptions,
+        context?.prompt?.config,
+        this.config,
+      );
+      const resolvedEffort =
+        configuredEffort == null ? undefined : renderVarsInObject(configuredEffort, context?.vars);
+      if (resolvedEffort === undefined) {
+        delete result.body.reasoning_effort;
+      } else {
+        Object.assign(result.body, { reasoning_effort: resolvedEffort });
+      }
+    }
+    if (usesGrok47 || GROK_BUILD_CHAT_MODELS.has(model) || usesPassthroughReasoningModel) {
+      const tokenLimit =
+        getXAIRequestOption(
+          ['max_completion_tokens', 'max_tokens'],
+          testOptions,
+          context?.prompt?.config,
+          this.config,
+        ) ?? getOpenAIChatOutputLimitFromEnv();
+      delete result.body.max_tokens;
+      delete result.body.max_completion_tokens;
+      if (tokenLimit !== undefined) {
+        const key = GROK_BUILD_CHAT_MODELS.has(model) ? 'max_tokens' : 'max_completion_tokens';
+        Object.assign(result.body, { [key]: tokenLimit });
+      }
+    }
+
+    // Filter out unsupported sampling controls for Grok-4-family models.
+    if (GROK_4_MODELS.includes(model)) {
       delete result.body.presence_penalty;
       delete result.body.frequency_penalty;
       delete result.body.stop;
-      // Grok-4 doesn't support reasoning_effort parameter
-      delete result.body.reasoning_effort;
     }
 
+    validateXAIReasoningEffort(model, result.body.reasoning_effort, 'reasoning_effort');
+
     // Filter reasoning_effort for models that don't support it
-    if (!this.supportsReasoningEffort() && result.body.reasoning_effort) {
+    if (!GROK_REASONING_EFFORT_MODELS.includes(model) && result.body.reasoning_effort) {
       delete result.body.reasoning_effort;
     }
 
@@ -370,8 +912,8 @@ class XAIProvider extends OpenAiChatCompletionProvider {
     }
 
     // Note: xAI Agent Tools (web_search, x_search, code_execution, etc.) require
-    // the Responses API endpoint which is not yet implemented. For now, use
-    // search_parameters for live search functionality.
+    // the Responses API endpoint. Use xai:responses:<model> for server-side tools;
+    // this chat-completions provider keeps legacy search_parameters support.
 
     return result;
   }
@@ -386,9 +928,9 @@ class XAIProvider extends OpenAiChatCompletionProvider {
         ...providerOptions.config,
         ...xaiConfig, // Merge the nested config into the main config
         apiKeyEnvar: 'XAI_API_KEY',
-        apiBaseUrl: xaiConfig?.region
-          ? `https://${xaiConfig.region}.api.x.ai/v1`
-          : 'https://api.x.ai/v1',
+        apiBaseUrl:
+          xaiConfig?.apiBaseUrl ??
+          (xaiConfig?.region ? `https://${xaiConfig.region}.api.x.ai/v1` : 'https://api.x.ai/v1'),
       },
     });
 
@@ -405,14 +947,40 @@ class XAIProvider extends OpenAiChatCompletionProvider {
   }
 
   toJSON() {
-    return {
-      provider: 'xai',
-      model: this.modelName,
-      config: {
-        ...this.config,
-        ...(this.apiKey && { apiKey: undefined }),
-      },
-    };
+    return serializeProvider(this, 'xai', () => this.apiKey);
+  }
+
+  protected calculateResponseCost(
+    data: OpenAiChatCompletionCostData,
+    config: OpenAiCompletionOptions,
+    cached: boolean,
+  ): number | undefined {
+    if (cached) {
+      return 0;
+    }
+
+    const xaiConfig = config as XAIConfig;
+    const usage = data.usage as
+      | (NonNullable<OpenAiChatCompletionCostData['usage']> & { cost_in_usd_ticks?: number })
+      | undefined;
+    const reportedCost = hasXAICostOverrides(xaiConfig) ? undefined : getXAICostInUsd(usage);
+
+    return (
+      reportedCost ??
+      calculateXAICost(
+        getXAIRequestModel(this.modelName, xaiConfig),
+        xaiConfig,
+        usage?.prompt_tokens,
+        usage?.completion_tokens,
+        usage?.completion_tokens_details?.reasoning_tokens,
+        usage?.prompt_tokens_details?.cached_tokens,
+        {
+          apiUrl: this.getApiUrl(),
+          reasoningBilledSeparately: true,
+          serviceTier: data.service_tier === 'priority' ? 'priority' : undefined,
+        },
+      )
+    );
   }
 
   async callApi(prompt: string, context?: any, callApiOptions?: any): Promise<any> {
@@ -428,87 +996,22 @@ class XAIProvider extends OpenAiChatCompletionProvider {
             response.error.includes('authentication error'))
         ) {
           // Provide a more helpful error message for x.ai specific issues
-          return {
+          return preserveResponseHeadersObserverErrorResponse(response, {
             ...response,
             error: `x.ai API error: ${response.error}\n\nTip: Ensure your XAI_API_KEY environment variable is set correctly. You can get an API key from https://x.ai/`,
-          };
+          });
         }
         return response;
       }
 
-      // Rest of the existing response processing logic
-      if (typeof response.raw === 'string') {
-        try {
-          const rawData = JSON.parse(response.raw);
-
-          if (
-            this.isReasoningModel() &&
-            rawData?.usage?.completion_tokens_details?.reasoning_tokens
-          ) {
-            const reasoningTokens = rawData.usage.completion_tokens_details.reasoning_tokens;
-            const acceptedPredictions =
-              rawData.usage.completion_tokens_details.accepted_prediction_tokens || 0;
-            const rejectedPredictions =
-              rawData.usage.completion_tokens_details.rejected_prediction_tokens || 0;
-
-            if (response.tokenUsage) {
-              response.tokenUsage.completionDetails = {
-                reasoning: reasoningTokens,
-                acceptedPrediction: acceptedPredictions,
-                rejectedPrediction: rejectedPredictions,
-              };
-
-              logger.debug(
-                `XAI reasoning token details for ${this.modelName}: ` +
-                  `reasoning=${reasoningTokens}, accepted=${acceptedPredictions}, rejected=${rejectedPredictions}`,
-              );
-            }
-          }
-        } catch (err) {
-          logger.error(`Failed to parse raw response JSON: ${err}`);
-        }
-      } else if (typeof response.raw === 'object' && response.raw !== null) {
-        const rawData = response.raw;
-
-        if (
-          this.isReasoningModel() &&
-          rawData?.usage?.completion_tokens_details?.reasoning_tokens
-        ) {
-          const reasoningTokens = rawData.usage.completion_tokens_details.reasoning_tokens;
-          const acceptedPredictions =
-            rawData.usage.completion_tokens_details.accepted_prediction_tokens || 0;
-          const rejectedPredictions =
-            rawData.usage.completion_tokens_details.rejected_prediction_tokens || 0;
-
-          if (response.tokenUsage) {
-            response.tokenUsage.completionDetails = {
-              reasoning: reasoningTokens,
-              acceptedPrediction: acceptedPredictions,
-              rejectedPrediction: rejectedPredictions,
-            };
-
-            logger.debug(
-              `XAI reasoning token details for ${this.modelName}: ` +
-                `reasoning=${reasoningTokens}, accepted=${acceptedPredictions}, rejected=${rejectedPredictions}`,
-            );
-          }
-        }
-      }
-
-      if (response.tokenUsage && !response.cached) {
-        const reasoningTokens = response.tokenUsage.completionDetails?.reasoning || 0;
-
-        response.cost = calculateXAICost(
-          this.modelName,
-          this.config || {},
-          response.tokenUsage.prompt,
-          response.tokenUsage.completion,
-          reasoningTokens,
-        );
-      }
-
       return response;
     } catch (err) {
+      if (isCallerAbortError(err, callApiOptions?.abortSignal)) {
+        throwIfAborted(callApiOptions?.abortSignal);
+      }
+      if (err instanceof XAIRequestConfigError) {
+        return { error: `xAI request error: ${err.message}` };
+      }
       // Handle JSON parsing errors and other API errors
       const errorMessage = err instanceof Error ? err.message : String(err);
 
@@ -540,4 +1043,12 @@ export function createXAIProvider(
   const modelName = splits.slice(1).join(':');
   invariant(modelName, 'Model name is required');
   return new XAIProvider(modelName, options);
+}
+
+function modelsWithCost(models: { id: string; aliases?: string[] }[], cost: XAIModelCost) {
+  return models.map(({ id, aliases }) => ({
+    id,
+    cost: { ...cost, ...(cost.longContext && { longContext: { ...cost.longContext } }) },
+    ...(aliases !== undefined && { aliases }),
+  }));
 }

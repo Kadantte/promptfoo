@@ -1,16 +1,17 @@
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 
 import chalk from 'chalk';
 import dedent from 'dedent';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { z } from 'zod';
-import { disableCache } from '../../cache';
+import { withCacheEnabled } from '../../cache';
 import cliState from '../../cliState';
 import { CLOUD_PROVIDER_PREFIX, DEFAULT_MAX_CONCURRENCY, VERSION } from '../../constants';
 import {
   checkEmailStatusAndMaybeExit,
+  EmailValidationError,
   getAuthor,
   getUserEmail,
   promptForEmailUnverified,
@@ -29,15 +30,21 @@ import {
   isCloudProvider,
   resolveTeamId,
 } from '../../util/cloud';
-import { resolveConfigs } from '../../util/config/load';
+import {
+  ConfigResolutionError,
+  logConfigResolutionError,
+  resolveConfigs,
+} from '../../util/config/load';
 import { writePromptfooConfig } from '../../util/config/writer';
 import { pathExists } from '../../util/file';
 import { getCustomPolicies } from '../../util/generation';
-import { printBorder, setupEnv } from '../../util/index';
+import { printBorder, renderVarsInObject, setupEnv } from '../../util/index';
 import invariant from '../../util/invariant';
 import { promptfooCommand } from '../../util/promptfooCommand';
 import { checkRedteamProbeLimit, MONTHLY_PROBE_LIMIT } from '../../util/redteamProbeLimit';
+import { accumulateTokenUsage } from '../../util/tokenUsageUtils';
 import { isUuid } from '../../util/uuid';
+import { loadYaml } from '../../util/yamlLoad';
 import { RedteamConfigSchema, RedteamGenerateOptionsSchema } from '../../validators/redteam';
 import {
   ADDITIONAL_STRATEGIES,
@@ -48,14 +55,17 @@ import {
   REDTEAM_MODEL,
   type Severity,
 } from '../constants';
+import { extractA2AAgentCardInfo } from '../extraction/a2aAgentCard';
 import { extractMcpToolsInfo } from '../extraction/mcpTools';
 import { MAX_MAX_CONCURRENCY, synthesize } from '../index';
 import { determinePolicyTypeFromId, isValidPolicyObject } from '../plugins/policy/utils';
 import { neverGenerateRemote, shouldGenerateRemote } from '../remoteGeneration';
-import { PartialGenerationError } from '../types';
+import { getRedteamGenerationContextFromProviders } from '../remoteGenerationContextFromProviders';
+import { PartialGenerationError, ProbeLimitExceededError } from '../types';
 import type { Command } from 'commander';
 
 import type { ApiProvider, TestSuite, UnifiedConfig } from '../../types/index';
+import type { TokenUsage } from '../../types/shared';
 import type {
   FailedPluginInfo,
   PolicyObject,
@@ -107,9 +117,107 @@ function handleFailedPlugins(failedPlugins: FailedPluginInfo[], strict: boolean)
   );
 }
 
-async function getConfigHash(configPath: string): Promise<string> {
+function getProviderTargetIds(providers: Partial<UnifiedConfig>['providers']): string[] {
+  if (!providers) {
+    return [];
+  }
+
+  const providerList = Array.isArray(providers) ? providers : [providers];
+  return providerList.flatMap((provider) => {
+    try {
+      return getProviderIds([provider]);
+    } catch {
+      return [];
+    }
+  });
+}
+
+function getDefaultPurposeVars(testSuite: TestSuite): Record<string, unknown> {
+  return typeof testSuite.defaultTest === 'object' && testSuite.defaultTest?.vars
+    ? testSuite.defaultTest.vars
+    : {};
+}
+
+function renderPurposeTemplate(purpose: string | undefined, vars: Record<string, unknown>): string {
+  if (!purpose?.trim()) {
+    return '';
+  }
+
+  return renderVarsInObject(purpose, vars as Record<string, any>);
+}
+
+function appendPurposeDetails(purpose: string, extraDetails: string): string {
+  if (!extraDetails) {
+    return purpose;
+  }
+
+  return purpose ? `${purpose}\n\n${extraDetails}\n\n` : extraDetails;
+}
+
+function resolveEffectivePurpose({
+  contextPurpose,
+  contextVars,
+  extraDetails,
+  rootPurpose,
+  testSuite,
+}: {
+  contextPurpose?: string;
+  contextVars?: Record<string, string>;
+  extraDetails: string;
+  rootPurpose?: string;
+  testSuite: TestSuite;
+}): string {
+  const selectedPurpose = contextPurpose?.trim() ? contextPurpose : rootPurpose;
+  const purposeVars = {
+    ...getDefaultPurposeVars(testSuite),
+    ...(contextVars || {}),
+  };
+  const renderedPurpose = renderPurposeTemplate(selectedPurpose, purposeVars);
+
+  return appendPurposeDetails(renderedPurpose, extraDetails);
+}
+
+function getNoTestCasesGeneratedMessage(strategies: RedteamStrategyObject[]): string {
+  const basicStrategy = strategies.find((strategy) => strategy.id === 'basic');
+  const basicDisabled = basicStrategy?.config?.enabled === false;
+
+  if (!basicDisabled) {
+    return 'No test cases generated. Please check for errors and try again.';
+  }
+
+  const activeStrategies = strategies.filter(
+    (strategy) => !(strategy.id === 'basic' && strategy.config?.enabled === false),
+  );
+
+  if (activeStrategies.length === 0) {
+    return dedent`
+      No final test cases were generated because the Basic strategy is disabled and no other strategies are selected.
+
+      The Basic strategy runs plugin-generated test cases as-is. Enable Basic to run your configured plugin tests directly, or select another strategy to transform them.
+    `;
+  }
+
+  return dedent`
+    No final test cases were generated. The Basic strategy is disabled, so plugin-generated test cases are excluded unless another selected strategy creates replacement tests.
+
+    Enable Basic to include plugin tests as-is, or review the selected strategies for generation errors.
+  `;
+}
+
+async function getConfigHash(
+  configPath: string,
+  options: Pick<RedteamCliGenerateOptions, 'filterProviders' | 'filterTargets'>,
+): Promise<string> {
   const content = await fs.readFile(configPath, 'utf8');
-  return createHash('md5').update(`${VERSION}:${content}`).digest('hex');
+  const filters = {
+    ...(options.filterProviders ? { filterProviders: options.filterProviders } : {}),
+    ...(options.filterTargets ? { filterTargets: options.filterTargets } : {}),
+  };
+  const hashInput =
+    Object.keys(filters).length > 0
+      ? JSON.stringify({ version: VERSION, content, filters })
+      : `${VERSION}:${content}`;
+  return createHash('sha256').update(hashInput).digest('hex');
 }
 
 function createHeaderComments({
@@ -166,13 +274,19 @@ export async function doGenerateRedteam(
   options: Partial<RedteamCliGenerateOptions>,
 ): Promise<Partial<UnifiedConfig> | null> {
   setupEnv(options.envFile);
-  if (!options.cache) {
+  const cacheOverride = options.cache === false ? false : undefined;
+  if (cacheOverride === false) {
     logger.info('Cache is disabled');
-    disableCache();
   }
 
+  return withCacheEnabled(cacheOverride, () => doGenerateRedteamInternal(options));
+}
+
+async function doGenerateRedteamInternal(
+  options: Partial<RedteamCliGenerateOptions>,
+): Promise<Partial<UnifiedConfig> | null> {
   // Check monthly probe limit for non-cloud users
-  const probeLimitResult = checkRedteamProbeLimit();
+  const probeLimitResult = await checkRedteamProbeLimit();
   if (!probeLimitResult.withinLimit) {
     logger.error(dedent`
       ${chalk.red.bold('Monthly probe limit reached')}
@@ -185,8 +299,7 @@ export async function doGenerateRedteam(
 
       For enterprise plans, contact ${chalk.cyan('inquiries@promptfoo.dev')}
     `);
-    process.exitCode = 1;
-    return null;
+    throw new ProbeLimitExceededError(probeLimitResult.used, MONTHLY_PROBE_LIMIT);
   }
 
   let testSuite: TestSuite;
@@ -195,6 +308,7 @@ export async function doGenerateRedteam(
   const outputPath = options.output || 'redteam.yaml';
   let commandLineOptions: Record<string, any> | undefined;
   let resolvedConfig: Partial<UnifiedConfig> | undefined;
+  let selectedProviderConfigs: Partial<UnifiedConfig>['providers'];
 
   // Write a remote config to a temporary file
   if (options.configFromCloud) {
@@ -216,11 +330,11 @@ export async function doGenerateRedteam(
     configPath &&
     (await pathExists(configPath))
   ) {
-    const redteamContent = yaml.load(
+    const redteamContent = loadYaml(
       await fs.readFile(outputPath, 'utf8'),
     ) as Partial<UnifiedConfig>;
     const storedHash = redteamContent.metadata?.configHash;
-    const currentHash = await getConfigHash(configPath);
+    const currentHash = await getConfigHash(configPath, options);
 
     if (storedHash === currentHash) {
       logger.warn(
@@ -237,6 +351,8 @@ export async function doGenerateRedteam(
     const resolved = await resolveConfigs(
       {
         config: [configPath],
+        filterProviders: options.filterProviders,
+        filterTargets: options.filterTargets,
       },
       options.defaultConfig || {},
     );
@@ -244,8 +360,12 @@ export async function doGenerateRedteam(
     redteamConfig = resolved.config.redteam;
     commandLineOptions = resolved.commandLineOptions;
     resolvedConfig = resolved.config;
+    selectedProviderConfigs = resolved.selectedProviderConfigs ?? resolved.config.providers;
 
-    await checkCloudPermissions(resolved.config);
+    await checkCloudPermissions({
+      ...resolved.config,
+      providers: selectedProviderConfigs,
+    });
 
     // Warn if both tests section and redteam config are present
     if (redteamConfig && resolved.testSuite.tests && resolved.testSuite.tests.length > 0) {
@@ -269,7 +389,7 @@ export async function doGenerateRedteam(
 
     try {
       // If the provider is a cloud provider, check for plugin severity overrides:
-      const providerId = getProviderIds(resolved.config.providers!)[0];
+      const providerId = getProviderIds(selectedProviderConfigs!)[0];
       if (isCloudProvider(providerId)) {
         const cloudId = getCloudDatabaseId(providerId);
         const overrides = await getPluginSeverityOverridesFromCloud(cloudId);
@@ -498,35 +618,41 @@ export async function doGenerateRedteam(
     throw new Error(`Invalid redteam configuration:\n${errorMessage}`);
   }
 
-  // Extract target IDs from the config providers (targets get rewritten to providers)
-  // IDs are used for retry strategy to match failed tests by target ID
-  const targetIds: string[] =
-    (Array.isArray(resolvedConfig?.providers)
-      ? resolvedConfig.providers
-          .filter((target) => typeof target !== 'function')
-          .map((target) => {
-            if (typeof target === 'string') {
-              return target; // Use the provider string as ID
-            }
-            const providerObj = target as { id?: string };
-            return providerObj.id;
-          })
-          .filter((id): id is string => typeof id === 'string')
-      : []) ?? [];
+  // Resolve IDs at this orchestration boundary so the context helper stays independent of the
+  // provider registry. IDs are used for retry strategy to match failed tests by target ID.
+  const providerTargetIds = getProviderTargetIds(selectedProviderConfigs);
+  const redteamGenerationContext = getRedteamGenerationContextFromProviders(
+    selectedProviderConfigs,
+    providerTargetIds,
+  );
+  const targetIds = redteamGenerationContext.providerTargetIds;
+  const cloudTargetDatabaseId = redteamGenerationContext.cloudTargetId;
 
   logger.debug(
     `Extracted ${targetIds.length} target IDs from config providers: ${JSON.stringify(targetIds)}`,
   );
 
-  // Extract MCP tools information and add to purpose
-  let enhancedPurpose = parsedConfig.data.purpose || '';
+  // Extract MCP tools information and add it after purpose templating is resolved.
+  const rootPurpose = parsedConfig.data.purpose;
+  let purposeDetails = '';
   let augmentedTestGenerationInstructions = config.testGenerationInstructions ?? '';
+  try {
+    const a2aAgentCardInfo = await extractA2AAgentCardInfo(testSuite.providers);
+    if (a2aAgentCardInfo) {
+      purposeDetails += a2aAgentCardInfo;
+      logger.info('Added A2A Agent Card information to red team purpose');
+    }
+  } catch (error) {
+    logger.warn(
+      `Failed to extract A2A Agent Card information: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
   try {
     const mcpToolsInfo = await extractMcpToolsInfo(testSuite.providers);
     if (mcpToolsInfo) {
-      enhancedPurpose = enhancedPurpose
-        ? `${enhancedPurpose}\n\n${mcpToolsInfo}\n\n`
-        : mcpToolsInfo;
+      purposeDetails += mcpToolsInfo;
       logger.info('Added MCP tools information to red team purpose');
       augmentedTestGenerationInstructions += `\nGenerate every test case prompt as a json string encoding the tool call and parameters, and choose a specific function to call. The specific format should be: {"tool": "function_name", "args": {...}}.`;
     }
@@ -543,6 +669,13 @@ export async function doGenerateRedteam(
   let entities: string[] = [];
   let finalInjectVar: string = '';
   let failedPlugins: { pluginId: string; requested: number }[] = [];
+  const generationTokenUsage: TokenUsage = {
+    cached: 0,
+    completion: 0,
+    numRequests: 0,
+    prompt: 0,
+    total: 0,
+  };
 
   if (contexts && contexts.length > 0) {
     // Multi-context mode: generate tests for each context
@@ -550,11 +683,18 @@ export async function doGenerateRedteam(
 
     // Collect failed plugins across all contexts
     const allFailedPlugins: { pluginId: string; requested: number }[] = [];
+    let firstContextPurpose: string | undefined;
 
     for (const context of contexts) {
       logger.info(`  Generating tests for context: ${context.id}`);
 
-      const contextPurpose = context.purpose + (enhancedPurpose ? `\n\n${enhancedPurpose}` : '');
+      const contextPurpose = resolveEffectivePurpose({
+        contextPurpose: context.purpose,
+        contextVars: context.vars,
+        extraDetails: purposeDetails,
+        rootPurpose,
+        testSuite,
+      });
 
       const contextResult = await withGenerationConcurrency(
         config.maxConcurrency,
@@ -569,6 +709,8 @@ export async function doGenerateRedteam(
             maxConcurrency: config.maxConcurrency,
             delay: config.delay,
             abortSignal: options.abortSignal,
+            redteamGenerationContext,
+            cloudTargetDatabaseId,
             targetIds,
             showProgressBar: options.progressBar !== false,
             testGenerationInstructions: augmentedTestGenerationInstructions,
@@ -579,6 +721,8 @@ export async function doGenerateRedteam(
       if (contextResult.failedPlugins.length > 0) {
         allFailedPlugins.push(...contextResult.failedPlugins);
       }
+      accumulateTokenUsage(generationTokenUsage, contextResult.generationTokenUsage);
+      firstContextPurpose ??= contextResult.purpose;
 
       // Tag each test with context metadata and merge context vars
       // IMPORTANT: Set metadata.purpose so graders and strategies use the correct context purpose
@@ -590,7 +734,7 @@ export async function doGenerateRedteam(
         },
         metadata: {
           ...test.metadata,
-          purpose: context.purpose, // Override purpose for graders/strategies
+          purpose: contextResult.purpose,
           contextId: context.id,
           contextVars: context.vars,
         },
@@ -610,23 +754,30 @@ export async function doGenerateRedteam(
     // Store failed plugins for handling after the try block starts
     failedPlugins = allFailedPlugins;
 
-    // Use first context's purpose for backward compatibility in output
-    purpose = contexts[0].purpose;
+    // Use the first generated context purpose for backward compatibility in shared metadata.
+    purpose = firstContextPurpose || '';
     logger.info(
       `Generated ${redteamTests.length} total test cases across ${contexts.length} contexts`,
     );
   } else {
     // Single purpose mode (existing behavior)
+    const effectivePurpose = resolveEffectivePurpose({
+      extraDetails: purposeDetails,
+      rootPurpose,
+      testSuite,
+    });
     const result = await withGenerationConcurrency(config.maxConcurrency, config.delay, () =>
       synthesize({
         ...parsedConfig.data,
         inputs: targetInputs,
-        purpose: enhancedPurpose,
+        purpose: effectivePurpose,
         numTests: config.numTests,
         prompts: testSuite.prompts.map((prompt) => prompt.raw),
         maxConcurrency: config.maxConcurrency,
         delay: config.delay,
         abortSignal: options.abortSignal,
+        redteamGenerationContext,
+        cloudTargetDatabaseId,
         targetIds,
         showProgressBar: options.progressBar !== false,
         testGenerationInstructions: augmentedTestGenerationInstructions,
@@ -638,6 +789,7 @@ export async function doGenerateRedteam(
     entities = result.entities;
     finalInjectVar = result.injectVar;
     failedPlugins = result.failedPlugins;
+    accumulateTokenUsage(generationTokenUsage, result.generationTokenUsage);
   }
 
   /**
@@ -668,18 +820,45 @@ export async function doGenerateRedteam(
     handleFailedPlugins(failedPlugins, options.strict ?? false);
 
     if (redteamTests.length === 0) {
-      logger.warn('No test cases generated. Please check for errors and try again.');
+      logger.warn(getNoTestCasesGeneratedMessage(strategyObjs));
       return null;
     }
 
+    const authoredPurpose =
+      typeof redteamConfig?.purpose === 'string'
+        ? redteamConfig.purpose
+        : typeof options.purpose === 'string'
+          ? options.purpose
+          : undefined;
     const updatedRedteamConfig = {
-      purpose,
+      purpose: authoredPurpose ?? purpose,
       entities,
       strategies: strategyObjs || [],
       plugins: plugins || [],
       sharing: config.sharing,
       ...(contexts && contexts.length > 0 ? { contexts } : {}),
     };
+    const generationRequestCount = generationTokenUsage.numRequests ?? 0;
+    const generation = {
+      id: options.generationRunId ?? randomUUID(),
+      generatedAt: new Date().toISOString(),
+      ...(generationRequestCount > 0 ? { tokenUsage: generationTokenUsage } : {}),
+    };
+    if (generationRequestCount > 0) {
+      const hasReportedGenerationTokens =
+        (generationTokenUsage.total ?? 0) > 0 ||
+        (generationTokenUsage.prompt ?? 0) > 0 ||
+        (generationTokenUsage.completion ?? 0) > 0 ||
+        (generationTokenUsage.cached ?? 0) > 0;
+      logger.info(
+        hasReportedGenerationTokens
+          ? `Observed generation token usage: ${(generationTokenUsage.total ?? 0).toLocaleString()} total ` +
+              `(${(generationTokenUsage.prompt ?? 0).toLocaleString()} input, ` +
+              `${(generationTokenUsage.completion ?? 0).toLocaleString()} output) across ` +
+              `${generationRequestCount.toLocaleString()} request(s)`
+          : `Observed generation requests: ${generationRequestCount.toLocaleString()} (provider did not report token usage)`,
+      );
+    }
 
     let ret: Partial<UnifiedConfig> | undefined;
     if (options.output && options.output.endsWith('.burp')) {
@@ -702,10 +881,14 @@ export async function doGenerateRedteam(
       return {};
     } else if (options.output) {
       const existingYaml = configPath
-        ? (yaml.load(await fs.readFile(configPath, 'utf8')) as Partial<UnifiedConfig>)
+        ? (loadYaml(await fs.readFile(configPath, 'utf8')) as Partial<UnifiedConfig>)
         : {};
       const existingDefaultTest =
         typeof existingYaml.defaultTest === 'object' ? existingYaml.defaultTest : {};
+      const existingMetadata = { ...(existingYaml.metadata || {}) };
+      delete existingMetadata.generationTokenUsage;
+      delete existingMetadata.generation;
+      delete existingMetadata.generationAccounting;
       const updatedYaml: Partial<UnifiedConfig> = {
         ...existingYaml,
         ...(options.description ? { description: options.description } : {}),
@@ -720,10 +903,12 @@ export async function doGenerateRedteam(
         tests: redteamTests,
         redteam: { ...(existingYaml.redteam || {}), ...updatedRedteamConfig },
         metadata: {
-          ...(existingYaml.metadata || {}),
+          ...existingMetadata,
           ...(configPath && redteamTests.length > 0
-            ? { configHash: await getConfigHash(configPath) }
+            ? { configHash: await getConfigHash(configPath, options) }
             : { configHash: 'force-regenerate' }),
+          ...((generationTokenUsage.numRequests ?? 0) > 0 && { generationTokenUsage }),
+          generation,
           ...(pluginSeverityOverridesId ? { pluginSeverityOverridesId } : {}),
         },
       };
@@ -759,7 +944,7 @@ export async function doGenerateRedteam(
       }
       printBorder();
     } else if (options.write && configPath) {
-      const existingConfig = yaml.load(
+      const existingConfig = loadYaml(
         await fs.readFile(configPath, 'utf8'),
       ) as Partial<UnifiedConfig>;
       const existingTests = existingConfig.tests;
@@ -784,10 +969,16 @@ export async function doGenerateRedteam(
       }
       existingConfig.tests = [...testsArray, ...redteamTests];
       existingConfig.redteam = { ...(existingConfig.redteam || {}), ...updatedRedteamConfig };
+      const existingMetadata = { ...(existingConfig.metadata || {}) };
+      delete existingMetadata.generationTokenUsage;
+      delete existingMetadata.generation;
+      delete existingMetadata.generationAccounting;
       // Add the config hash to metadata
       existingConfig.metadata = {
-        ...(existingConfig.metadata || {}),
-        configHash: await getConfigHash(configPath),
+        ...existingMetadata,
+        configHash: await getConfigHash(configPath, options),
+        ...((generationTokenUsage.numRequests ?? 0) > 0 && { generationTokenUsage }),
+        generation,
       };
       const author = getAuthor();
       const userEmail = getUserEmail();
@@ -828,6 +1019,10 @@ export async function doGenerateRedteam(
       ret = writePromptfooConfig(
         {
           ...(options.description ? { description: options.description } : {}),
+          metadata: {
+            ...((generationTokenUsage.numRequests ?? 0) > 0 ? { generationTokenUsage } : {}),
+            generation,
+          },
           tests: redteamTests,
         },
         'redteam.yaml',
@@ -1016,7 +1211,13 @@ export function redteamGenerateCommand(
           error.issues.forEach((err: z.ZodIssue) => {
             logger.error(`  ${err.path.join('.')}: ${err.message}`);
           });
-        } else {
+        } else if (error instanceof ConfigResolutionError) {
+          logConfigResolutionError(error);
+        } else if (
+          !(error instanceof EmailValidationError) &&
+          !(error instanceof ProbeLimitExceededError)
+        ) {
+          // These expected failures are already logged by their helpers.
           // Log the stack trace, which already includes the error message
           logger.error(
             error instanceof Error && error.stack

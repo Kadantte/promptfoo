@@ -66,24 +66,22 @@ export const isCriticalSeverity = (severity: string): boolean => {
   return severity === 'critical' || severity === 'error';
 };
 
-/**
- * Maps severity for filtering purposes, handling the critical/error equivalence
- * @param selectedSeverity - The selected severity filter
- * @param issueSeverity - The issue's severity level
- * @returns True if the issue matches the filter
- */
-export const mapSeverityForFiltering = (
-  selectedSeverity: string | null,
-  issueSeverity: string,
-): boolean => {
-  if (!selectedSeverity) {
-    return true;
-  }
-
-  // Handle critical/error mapping
-  if (selectedSeverity === 'error') {
-    return isCriticalSeverity(issueSeverity);
-  }
-
-  return issueSeverity === selectedSeverity;
+export const hasModelAuditFindings = (results: {
+  has_errors?: boolean;
+  failed_checks?: number;
+  failedChecks?: number;
+  checks?: Array<{ status?: string }>;
+  issues?: Array<{ severity?: string }>;
+}): boolean => {
+  return Boolean(
+    results.has_errors ||
+      (results.failed_checks ?? results.failedChecks ?? 0) > 0 ||
+      results.checks?.some((check) => check.status === 'failed') ||
+      results.issues?.some(
+        (issue) =>
+          issue.severity === 'critical' ||
+          issue.severity === 'error' ||
+          issue.severity === 'warning',
+      ),
+  );
 };

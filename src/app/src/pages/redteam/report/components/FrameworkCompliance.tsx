@@ -3,6 +3,7 @@ import React from 'react';
 import { Card, CardContent } from '@app/components/ui/card';
 import { cn } from '@app/lib/utils';
 import { formatASRForDisplay } from '@app/utils/redteam';
+import { calculateAttackSuccessRate } from '@promptfoo/presentation/redteamMetrics';
 import {
   ALIASED_PLUGIN_MAPPINGS,
   FRAMEWORK_COMPLIANCE_IDS,
@@ -10,7 +11,6 @@ import {
   riskCategorySeverityMap,
   Severity,
 } from '@promptfoo/redteam/constants';
-import { calculateAttackSuccessRate } from '@promptfoo/redteam/metrics';
 import FrameworkCard from './FrameworkCard';
 import {
   categorizePlugins,
@@ -172,7 +172,10 @@ const FrameworkCompliance = ({ evalId, categoryStats, config }: FrameworkComplia
 
   return (
     <div>
-      <div className="mb-4 flex items-center justify-between">
+      <div
+        data-testid="framework-compliance-header"
+        className="mb-4 flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between"
+      >
         <h2 className="text-xl font-semibold">
           Framework Compliance ({Object.values(frameworkCompliance).filter(Boolean).length}/
           {frameworksToShow.length})

@@ -1,6 +1,6 @@
 import { RenderResult, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
 import Prompts from './Prompts';
 import type { ServerPromptWithMetadata } from '@promptfoo/types';
@@ -293,6 +293,31 @@ describe('Prompts', () => {
 
     // Should appear in both Label column and Prompt column
     expect(cells.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('keeps fallback labels compact when raw prompt text is long', () => {
+    const longRawPrompt =
+      'You are an internal corporate chatbot. Respond to this query using only the supplied context.';
+    const mockPromptsWithLongFallbackLabel: ServerPromptWithMetadata[] = [
+      {
+        id: 'prompt:long-fallback-label',
+        prompt: {
+          raw: longRawPrompt,
+          label: '',
+        },
+        count: 1,
+        recentEvalDate: '2023-10-27T10:00:00.000Z',
+        recentEvalId: 'eval-123',
+        evals: [],
+      },
+    ];
+
+    renderWithProviders({ data: mockPromptsWithLongFallbackLabel });
+
+    const matchingCells = screen.getAllByText(longRawPrompt);
+    const fallbackLabel = matchingCells.find((cell) => cell.classList.contains('line-clamp-2'));
+
+    expect(fallbackLabel).toHaveClass('line-clamp-2', 'break-words');
   });
 
   it('should render the Label column in DataGrid on very narrow viewport widths', () => {

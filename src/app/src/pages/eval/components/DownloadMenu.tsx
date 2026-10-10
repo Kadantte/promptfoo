@@ -6,10 +6,11 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@app/component
 import { DropdownMenuItem, DropdownMenuItemIcon } from '@app/components/ui/dropdown-menu';
 import invariant from '@promptfoo/util/invariant';
 import { removeEmpty } from '@promptfoo/util/objectUtils';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { CheckCircle, Copy, Download } from 'lucide-react';
 import { DownloadFormat, downloadBlob, useDownloadEval } from '../../../hooks/useDownloadEval';
 import { useToast } from '../../../hooks/useToast';
+import { toPortableConfig } from '../../../utils/portableConfig';
 import { useTableStore as useResultsViewStore } from './store';
 import type { UnifiedConfig } from '@promptfoo/types';
 
@@ -54,12 +55,12 @@ function CommandBlock({ fileName, helpText, isDownloaded, onCopy }: CommandBlock
           )}
         </div>
       )}
-      <div className="flex items-center bg-white/80 dark:bg-black/40 border border-black/15 dark:border-white/15 rounded-md p-3">
+      <div className="flex flex-col items-stretch gap-2 rounded-md border border-black/15 bg-white/80 p-3 dark:border-white/15 dark:bg-black/40 sm:flex-row sm:items-center">
         <code className="flex-1 font-mono text-sm font-medium">{commandText}</code>
         <button
           type="button"
           onClick={() => onCopy(commandText)}
-          className="ml-2 p-1 text-primary hover:bg-primary/15 rounded transition-colors"
+          className="self-end rounded p-1 text-primary transition-colors hover:bg-primary/15 sm:ml-2 sm:self-auto"
           aria-label="Copy command"
         >
           <Copy className="size-4" />
@@ -84,18 +85,9 @@ export function DownloadDialog({ open, onClose }: DownloadDialogProps) {
   const { showToast } = useToast();
 
   // Use the new hooks for CSV and JSON downloads
-  const { download: downloadCsvApi, isLoading: isLoadingCsv } = useDownloadEval(
-    DownloadFormat.CSV,
-    {
-      onSuccess: (fileName) => setDownloadedFiles((prev) => new Set([...prev, fileName])),
-    },
-  );
+  const { download: downloadCsvApi, isLoading: isLoadingCsv } = useDownloadEval(DownloadFormat.CSV);
   const { download: downloadJsonApi, isLoading: isLoadingJson } = useDownloadEval(
     DownloadFormat.JSON,
-
-    {
-      onSuccess: (fileName) => setDownloadedFiles((prev) => new Set([...prev, fileName])),
-    },
   );
 
   const openDownloadDialog = (blob: Blob, downloadName: string) => {
@@ -137,7 +129,7 @@ export function DownloadDialog({ open, onClose }: DownloadDialogProps) {
     const schemaLine = '# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json\n';
 
     // Clean top-level empty properties
-    const cleanConfig = removeEmpty(configToDownload);
+    const cleanConfig = removeEmpty(toPortableConfig(configToDownload));
 
     // Convert to YAML
     const configData = yaml.dump(cleanConfig, options);
@@ -221,25 +213,13 @@ export function DownloadDialog({ open, onClose }: DownloadDialogProps) {
     handleClose();
   };
 
-  const downloadTable = async () => {
+  const downloadResults = async (download: (evalId: string) => Promise<void>) => {
     if (!evalId) {
       showToast('No evaluation ID', 'error');
       return;
     }
     try {
-      await downloadJsonApi(evalId);
-    } catch {
-      // Error is already handled by the hook
-    }
-  };
-
-  const downloadCsv = async () => {
-    if (!evalId) {
-      showToast('No evaluation ID', 'error');
-      return;
-    }
-    try {
-      await downloadCsvApi(evalId);
+      await download(evalId);
     } catch {
       // Error is already handled by the hook
     }
@@ -390,7 +370,7 @@ export function DownloadDialog({ open, onClose }: DownloadDialogProps) {
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <Button
-                  onClick={downloadCsv}
+                  onClick={() => downloadResults(downloadCsvApi)}
                   variant="outline"
                   className="h-12"
                   disabled={isLoadingCsv}
@@ -400,7 +380,7 @@ export function DownloadDialog({ open, onClose }: DownloadDialogProps) {
                 </Button>
 
                 <Button
-                  onClick={downloadTable}
+                  onClick={() => downloadResults(downloadJsonApi)}
                   variant="outline"
                   className="h-12"
                   disabled={isLoadingJson}

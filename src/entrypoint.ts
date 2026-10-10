@@ -4,11 +4,14 @@
  * This file intentionally has NO dependencies to ensure the Node.js version
  * check runs before any module loading that might fail on older versions.
  *
- * Some dependencies (like string-width via ora) use ES2024 features (e.g., RegExp /v flag)
- * that cause cryptic syntax errors on Node.js < 20. By checking the version first,
+ * Some dependencies (like string-width via ora) use modern language features (e.g., RegExp /v flag)
+ * that cause cryptic syntax errors on unsupported Node.js versions. By checking the version first,
  * we can provide a helpful error message instead.
  */
+import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { requestsStructuredCodeScanOutput } from './codeScan/util/structuredOutputDetect';
 
 type NodeEngineComparatorOperator = '=' | '>' | '>=' | '<' | '<=';
 type NodeEngineVersionTuple = [number, number, number];
@@ -24,9 +27,9 @@ type ParseNodeEngineVersionOptions = {
 declare const __PROMPTFOO_NODE_ENGINE_RANGE__: string | undefined;
 declare const __PROMPTFOO_NODE_ENGINE_COMPARATOR_SETS__: NodeEngineComparator[][] | undefined;
 
-const fallbackNodeEngineRange = '>=20.0.0';
+const fallbackNodeEngineRange = '>=22.22.0';
 const fallbackNodeEngineComparatorSets: NodeEngineComparator[][] = [
-  [{ operator: '>=', version: '20.0.0' }],
+  [{ operator: '>=', version: '22.22.0' }],
 ];
 
 const nodeEngineRange =
@@ -37,7 +40,6 @@ const nodeEngineComparatorSets =
   typeof __PROMPTFOO_NODE_ENGINE_COMPARATOR_SETS__ === 'undefined'
     ? fallbackNodeEngineComparatorSets
     : __PROMPTFOO_NODE_ENGINE_COMPARATOR_SETS__;
-
 function parseNodeEngineVersion(
   version: string,
   options: ParseNodeEngineVersionOptions = {},
@@ -61,16 +63,8 @@ function compareNodeEngineVersion(
   left: NodeEngineVersionTuple,
   right: NodeEngineVersionTuple,
 ): number {
-  for (let index = 0; index < left.length; index++) {
-    if (left[index] > right[index]) {
-      return 1;
-    }
-    if (left[index] < right[index]) {
-      return -1;
-    }
-  }
-
-  return 0;
+  const index = left.findIndex((part, index) => part !== right[index]);
+  return index === -1 ? 0 : left[index] > right[index] ? 1 : -1;
 }
 
 function satisfiesNodeEngineComparator(
@@ -105,12 +99,10 @@ function isSupportedNodeEngineVersion(currentVersion: string): boolean | null {
     return null;
   }
 
-  return nodeEngineComparatorSets.some(
-    (comparatorSet) =>
-      comparatorSet.length === 0 ||
-      comparatorSet.every((comparator) =>
-        satisfiesNodeEngineComparator(parsedCurrentVersion, comparator),
-      ),
+  return nodeEngineComparatorSets.some((comparatorSet) =>
+    comparatorSet.every((comparator) =>
+      satisfiesNodeEngineComparator(parsedCurrentVersion, comparator),
+    ),
   );
 }
 
@@ -148,6 +140,21 @@ if (!isBun && !isDeno) {
     console.error(formatUnsupportedNodeVersionMessage(process.version));
     process.exit(1);
   }
+}
+
+// Only mutate global state when this file is the actual CLI entry point. Test runners
+// that import this module (e.g. to exercise version checks) keep `process.argv` from the
+// runner itself, which would otherwise leak `LOG_LEVEL=error` into the test process.
+const entryUrl = fileURLToPath(import.meta.url);
+const invokedAsCli =
+  typeof process.argv[1] === 'string' && path.resolve(process.argv[1]) === entryUrl;
+
+// Structured code-scan modes reserve stdout for the payload. This has to happen
+// before importing main.ts because some startup modules log while they initialize.
+if (invokedAsCli && requestsStructuredCodeScanOutput(process.argv.slice(2))) {
+  // Reserve stdout for the SARIF/JSON payload: quiet the logger and route
+  // whatever it still emits to stderr so it cannot corrupt that payload.
+  Object.assign(process.env, { LOG_LEVEL: 'error', PROMPTFOO_LOG_TO_STDERR: 'true' });
 }
 
 // Update argv[1] so isMainModule() in main.ts correctly detects CLI execution.

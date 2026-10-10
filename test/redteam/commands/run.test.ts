@@ -1,8 +1,14 @@
+const { createLoggerModuleWithLevel } = await vi.hoisted(
+  async () => import('../../factories/logger'),
+);
+
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EmailValidationError } from '../../../src/globalConfig/accounts';
 import logger from '../../../src/logger';
 import { redteamRunCommand } from '../../../src/redteam/commands/run';
 import { doRedteamRun } from '../../../src/redteam/shared';
+import { ProbeLimitExceededError } from '../../../src/redteam/types';
 import { getConfigFromCloud } from '../../../src/util/cloud';
 
 vi.mock('../../../src/cliState', () => ({
@@ -11,15 +17,7 @@ vi.mock('../../../src/cliState', () => ({
   },
 }));
 
-vi.mock('../../../src/logger', () => ({
-  default: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-  getLogLevel: vi.fn().mockReturnValue('info'),
-}));
+vi.mock('../../../src/logger', () => createLoggerModuleWithLevel());
 
 vi.mock('../../../src/telemetry', () => ({
   default: {
@@ -95,6 +93,7 @@ describe('redteamRunCommand', () => {
         config: undefined,
         loadedFromCloud: true,
         target: targetUUID,
+        eventSource: 'cli',
       }),
     );
   });
@@ -148,6 +147,23 @@ describe('redteamRunCommand', () => {
 
     // doRedteamRun should not be called
     expect(doRedteamRun).not.toHaveBeenCalled();
+  });
+
+  it('should not log an unexpected error for recoverable email validation failures', async () => {
+    vi.mocked(doRedteamRun).mockRejectedValueOnce(
+      new EmailValidationError(
+        'email_verification_required',
+        'Please verify your email address and try again.',
+      ),
+    );
+
+    const runCommand = program.commands.find((cmd) => cmd.name() === 'run');
+    expect(runCommand).toBeDefined();
+
+    await runCommand!.parseAsync(['node', 'test']);
+
+    expect(process.exitCode).toBe(1);
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it('should throw error when target is not a UUID', async () => {
@@ -204,6 +220,7 @@ describe('redteamRunCommand', () => {
         config: undefined,
         loadedFromCloud: true,
         target: targetUUID,
+        eventSource: 'cli',
       }),
     );
   });
@@ -246,6 +263,7 @@ describe('redteamRunCommand', () => {
           liveRedteamConfig: expect.objectContaining({
             description: customDescription,
           }),
+          eventSource: 'cli',
         }),
       );
     });
@@ -285,6 +303,7 @@ describe('redteamRunCommand', () => {
           liveRedteamConfig: expect.objectContaining({
             description: originalDescription,
           }),
+          eventSource: 'cli',
         }),
       );
     });
@@ -319,6 +338,100 @@ describe('redteamRunCommand', () => {
 
       // Verify that the description was overridden using short flag
       expect(mockConfig.description).toBe(customDescription);
+    });
+  });
+
+  describe('--tag flag for run-specific eval tags', () => {
+    it('should document the repeatable --tag option in help text', () => {
+      const runCommand = program.commands.find((cmd) => cmd.name() === 'run');
+      expect(runCommand).toBeDefined();
+
+      const helpText = runCommand!.helpInformation();
+
+      expect(helpText).toContain('--tag <key=value>');
+      expect(helpText).toContain('Set an eval tag in key=value format.');
+    });
+
+    it('should pass repeated tags to the evaluation stage with Commander normalization', async () => {
+      const runCommand = program.commands.find((cmd) => cmd.name() === 'run');
+      expect(runCommand).toBeDefined();
+
+      await runCommand!.parseAsync([
+        'node',
+        'test',
+        '--tag',
+        'build=first',
+        '--tag',
+        'build=second',
+        '--tag',
+        'token=a=b',
+        '--tag',
+        'empty=',
+      ]);
+
+      const options = vi.mocked(doRedteamRun).mock.calls[0][0];
+      expect(options).toMatchObject({
+        tags: {
+          build: 'second',
+          token: 'a=b',
+          empty: '',
+        },
+        eventSource: 'cli',
+      });
+      expect(options).not.toHaveProperty('tag');
+    });
+
+    it('should not add a tags property when no --tag is provided', async () => {
+      const runCommand = program.commands.find((cmd) => cmd.name() === 'run');
+      expect(runCommand).toBeDefined();
+
+      await runCommand!.parseAsync(['node', 'test']);
+
+      const options = vi.mocked(doRedteamRun).mock.calls[0][0];
+      // Avoid clobbering config-level tags with an undefined/empty runtime value.
+      expect(options).not.toHaveProperty('tags');
+      expect(options).not.toHaveProperty('tag');
+    });
+
+    it.each(['invalid', '=value'])('should reject malformed --tag value %s', (tagValue) => {
+      const runCommand = program.commands.find((cmd) => cmd.name() === 'run');
+      expect(runCommand).toBeDefined();
+      runCommand!.exitOverride();
+
+      expect(() => runCommand!.parseOptions(['--tag', tagValue])).toThrow(
+        '--tag must be specified in key=value format.',
+      );
+    });
+  });
+
+  describe('error handling', () => {
+    it('should suppress stack trace when doRedteamRun throws ProbeLimitExceededError', async () => {
+      vi.mocked(doRedteamRun).mockRejectedValueOnce(new ProbeLimitExceededError(100, 100));
+
+      const runCommand = program.commands.find((cmd) => cmd.name() === 'run');
+      expect(runCommand).toBeDefined();
+
+      await runCommand!.parseAsync(['node', 'test']);
+
+      expect(logger.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('An unexpected error occurred during red team run'),
+      );
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('should still log unexpected errors with stack', async () => {
+      const boom = new Error('boom');
+      vi.mocked(doRedteamRun).mockRejectedValueOnce(boom);
+
+      const runCommand = program.commands.find((cmd) => cmd.name() === 'run');
+      expect(runCommand).toBeDefined();
+
+      await runCommand!.parseAsync(['node', 'test']);
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('An unexpected error occurred during red team run: boom'),
+      );
+      expect(process.exitCode).toBe(1);
     });
   });
 });

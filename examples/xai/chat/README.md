@@ -1,6 +1,6 @@
 # xai/chat (xAI Grok Models Evaluation)
 
-This example demonstrates how to evaluate xAI's Grok models across their main capabilities: text generation with reasoning, image creation, and live search.
+This example demonstrates how to evaluate xAI's Grok models across their main capabilities: text generation with reasoning, image creation, and server-side search tools.
 
 You can run this example with:
 
@@ -21,7 +21,7 @@ This example requires the following environment variable:
 # Set your API key
 export XAI_API_KEY=your_api_key_here
 
-# Run the main evaluation
+# Run the main evaluation (EU-safe defaults)
 promptfoo eval
 
 # View results in the web interface
@@ -32,11 +32,11 @@ promptfoo view
 
 This example includes configurations to test different Grok capabilities:
 
-- **Text Generation** (`promptfooconfig.yaml`) - Mathematical reasoning with Grok 4.1 Fast, Grok 4 Fast, Grok 4, and Grok 3 models
+- **Text Generation** (`promptfooconfig.yaml`) - Grok 4.3 and Grok 4.20, with optional Grok 4.7 Chat and Responses, Grok 4.6, and Grok 4.5
 - **Image Generation** (`promptfooconfig.images.yaml`) - Artistic image creation using Grok's image models
-- **Live Search** (`promptfooconfig.search.yaml`) - Real-time web and X search using Live Search
+- **Search Tools** (`promptfooconfig.search.yaml`) - Real-time web and X search using the Responses API
 - **Agent Tools (Responses API)** (`promptfooconfig.responses.yaml`) - Autonomous web and X search using Agent Tools
-- **Search Demo** (`promptfooconfig.promptfoo-search.yaml`) - Live Search with assertions example
+- **Search Demo** (`promptfooconfig.promptfoo-search.yaml`) - Responses API search with assertions example
 
 ## Run Individual Tests
 
@@ -47,7 +47,7 @@ promptfoo eval -c promptfooconfig.yaml
 # Image generation with artistic styles
 promptfoo eval -c promptfooconfig.images.yaml
 
-# Live Search with web and X sources (deprecated Dec 15, 2025)
+# Search tools with web and X sources
 promptfoo eval -c promptfooconfig.search.yaml
 
 # Agent Tools with Responses API (recommended)
@@ -59,25 +59,52 @@ promptfoo eval -c promptfooconfig.promptfoo-search.yaml
 
 ## Featured Models
 
-### Grok 4.1 Fast (Latest)
+### Grok 4.7
 
-The newest frontier model optimized for agentic tool calling with a 2M context window:
+xAI's current flagship supports text and image input with a 500K context window:
 
-- `xai:grok-4-1-fast-reasoning` - Maximum intelligence with reasoning
-- `xai:grok-4-1-fast-non-reasoning` - Fast responses without reasoning
+- `xai:grok-4.7` - Chat Completions; set `reasoning_effort` to `low`, `medium`, `high` (default), or `xhigh`
+- `xai:responses:grok-4.7` - Responses API; set `reasoning.effort` to the same values
 
-### Grok 4 Fast
+Uncomment the Grok 4.7 blocks in `promptfooconfig.yaml` to compare the two endpoints. Both read `effort` from the test case, so they use the same reasoning setting.
 
-Fast reasoning models with 2M context:
+### Grok 4.6
 
-- `xai:grok-4-fast-reasoning` - Reasoning variant
-- `xai:grok-4-fast-non-reasoning` - Non-reasoning variant
+xAI's previous flagship model for coding, agentic tasks, and knowledge work (500K context):
 
-### Grok 4
+- `xai:grok-4.6` - Previous flagship reasoning model
+- `reasoning_effort` - Supports `low`, `medium`, `high`, and `xhigh` in chat configs (defaults to `high`; `none` is not accepted)
+- `xai:responses:grok-4.6` - Recommended form for server-side tools
 
-Flagship reasoning model:
+xAI publishes no aliases for this model, so use the exact `grok-4.6` id.
 
-- `xai:grok-4` - Full reasoning capabilities
+### Grok 4.5
+
+An earlier flagship, still available (500K context):
+
+- `xai:grok-4.5` - Flagship reasoning model
+- `reasoning_effort` - Supports `low`, `medium`, and `high` in chat configs (defaults to `high`; `none` is not accepted)
+- `xai:responses:grok-4.5` - Recommended form for server-side tools
+
+The main example keeps these flagship provider blocks optional. xAI has announced Grok 4.5 availability in the EU API Console; check your account for Grok 4.6 and 4.7 availability in other regions. The main config runs unchanged with Grok 4.3 and Grok 4.20.
+
+### Grok 4.3
+
+A general-purpose alternative for text workflows:
+
+- `xai:grok-4.3` - General-purpose reasoning model
+- `reasoning_effort` - Supports `none`, `low`, `medium`, and `high` in chat configs
+- `xai:responses:grok-4.3` - Responses API form for server-side tools
+
+### Grok 4.20
+
+- `xai:grok-4.20-reasoning` - Reasoning model
+- `xai:grok-4.20-non-reasoning` - Non-reasoning model
+- `xai:grok-4.20-multi-agent` - Multi-agent variant
+
+### Legacy Model Note
+
+xAI periodically retires older model slugs and may keep them working through redirects to newer replacements. This example uses Grok 4.5 and Grok 4.3 plus alias-style Grok 4.20 family IDs, matching xAI's guidance for configs that should track the current release within a family.
 
 ### Agent Tools (Responses API)
 
@@ -85,7 +112,7 @@ Enable autonomous tool execution via the Responses API:
 
 ```yaml
 providers:
-  - id: xai:responses:grok-4-1-fast-reasoning
+  - id: xai:responses:grok-4.3
     config:
       tools:
         - type: web_search
@@ -93,24 +120,21 @@ providers:
         - type: code_interpreter
 ```
 
-### Live Search (Deprecated Dec 15, 2025)
+### Search Tools
 
-Enable real-time search via `search_parameters`:
+Enable real-time search via the Responses API:
 
 ```yaml
 providers:
-  - id: xai:grok-4-1-fast-reasoning
+  - id: xai:responses:grok-4.3
     config:
-      search_parameters:
-        mode: auto
-        return_citations: true
-        sources:
-          - type: web
-          - type: x
+      tools:
+        - type: web_search
+        - type: x_search
 ```
 
 ## Expected Results
 
 - **Text Generation**: Grok will provide step-by-step mathematical solutions with clear reasoning
 - **Image Generation**: Generated images in the requested artistic styles
-- **Live Search**: Current information from web and X with source citations
+- **Search Tools**: Current information from web and X with source citations

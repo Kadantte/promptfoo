@@ -33,7 +33,7 @@ import {
 } from '@promptfoo/redteam/constants';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { useRecentlyUsedPlugins, useRedTeamConfig } from '../hooks/useRedTeamConfig';
 import PluginsTab from './PluginsTab';
@@ -347,6 +347,12 @@ const initialRecentPluginsState = useRecentlyUsedPlugins.getState();
 describe('PluginsTab', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  test('labels the plugin search input', () => {
+    renderComponent();
+
+    expect(screen.getByRole('searchbox', { name: 'Search plugins' })).toBeInTheDocument();
   });
 
   test('Component renders', () => {
@@ -802,6 +808,33 @@ describe('PluginsTab', () => {
         expect(
           screen.getByTestId('selected-plugin-needs-config-indirect-prompt-injection'),
         ).toBeInTheDocument();
+      });
+
+      test('labels plugin action buttons in the list and selected sidebar', async () => {
+        const testPlugins = ['indirect-prompt-injection', 'aegis'];
+
+        act(() => {
+          useRedTeamConfig.setState({
+            ...initialStoreState,
+            config: {
+              ...initialStoreState.config,
+              plugins: testPlugins,
+            },
+          });
+        });
+
+        renderComponent();
+
+        expect(
+          screen.getAllByRole('button', { name: 'Configure Indirect Prompt Injection' }),
+        ).toHaveLength(2);
+        expect(
+          screen.getByRole('button', { name: 'View documentation for Aegis Dataset' }),
+        ).toBeInTheDocument();
+        expect(
+          screen.getByRole('button', { name: 'Remove Indirect Prompt Injection' }),
+        ).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Remove Aegis Dataset' })).toBeInTheDocument();
       });
     });
   });
@@ -1706,6 +1739,17 @@ describe('PluginsTab', () => {
     });
 
     describe('Selected Plugins', () => {
+      test('selected plugins summary stacks below the list on narrow screens', () => {
+        renderComponent();
+
+        expect(screen.getByTestId('plugins-tab-container')).toHaveClass('flex-col', 'lg:flex-row');
+        expect(screen.getByTestId('selected-plugins-sidebar')).toHaveClass(
+          'w-full',
+          'lg:sticky',
+          'lg:w-80',
+        );
+      });
+
       test('"Clear All" button clears all selected plugins', async () => {
         const user = userEvent.setup();
 

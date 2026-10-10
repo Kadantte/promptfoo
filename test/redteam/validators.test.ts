@@ -1,14 +1,9 @@
+const { createLoggerModule } = await vi.hoisted(async () => import('../factories/logger'));
+
 import { describe, expect, it, vi } from 'vitest';
 
 // Mock logger for tests that need it
-vi.mock('../../src/logger', () => ({
-  default: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
+vi.mock('../../src/logger', () => createLoggerModule());
 
 import {
   type BasePlugin,
@@ -28,6 +23,7 @@ import {
 import { InputsSchema } from '../../src/redteam/types';
 import {
   RedteamConfigSchema,
+  RedteamContextSchema,
   RedteamGenerateOptionsSchema,
   RedteamPluginObjectSchema,
   RedteamPluginSchema,
@@ -126,10 +122,16 @@ describe('redteamGenerateOptionsSchema', () => {
       maxConcurrency: 5,
       maxCharsPerMessage: 125,
       delay: 1000,
+      filterProviders: 'openai',
+      filterTargets: 'target-team-b',
     };
 
     const result = RedteamGenerateOptionsSchema.safeParse(options);
     expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.filterProviders).toBe('openai');
+      expect(result.data.filterTargets).toBe('target-team-b');
+    }
   });
 
   it('should reject invalid plugin names', () => {
@@ -238,6 +240,25 @@ describe('redteamPluginSchema', () => {
 });
 
 describe('redteamConfigSchema', () => {
+  it.each([
+    { id: 'missing-purpose' },
+    { id: 'empty-purpose', purpose: '' },
+    { id: 'blank-purpose', purpose: '   ' },
+  ])('should accept contexts with optional or blank purposes: $id', (context) => {
+    const result = RedteamContextSchema.safeParse(context);
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      return;
+    }
+
+    if (context.purpose === undefined) {
+      expect(result.data.purpose).toBeUndefined();
+    } else {
+      expect(result.data.purpose).toBeTypeOf('string');
+      expect(result.data.purpose?.trim()).toBe('');
+    }
+  });
+
   it('should accept a valid configuration with all fields', () => {
     const input = {
       purpose: 'You are a travel agent',
@@ -1046,7 +1067,7 @@ describe('RedteamConfigSchema transform', () => {
     ).toBe(false);
   });
 
-  it('should expand collection plugins correctly', () => {
+  const verifyHarmfulPluginExpansion = () => {
     const result = RedteamConfigSchema.parse({
       numTests: 5,
       plugins: ['harmful'],
@@ -1058,7 +1079,9 @@ describe('RedteamConfigSchema transform', () => {
       true,
     );
     expect(result.plugins?.every((p: RedteamPluginObject) => p.numTests === 5)).toBe(true);
-  });
+  };
+
+  it('should expand collection plugins correctly', verifyHarmfulPluginExpansion);
 
   it('should expand coding-agent collections correctly', () => {
     const coreResult = RedteamConfigSchema.parse({
@@ -1300,19 +1323,7 @@ describe('RedteamConfigSchema transform', () => {
       'purpose',
     ]);
   });
-  it('should expand harmful plugin to all harm categories', () => {
-    const result = RedteamConfigSchema.parse({
-      numTests: 5,
-      plugins: ['harmful'],
-    });
-
-    // Should expand 'harmful' into individual harm categories
-    // Note: bias plugins are separate from harmful plugins now
-    expect(result.plugins?.every((p: RedteamPluginObject) => p.id.startsWith('harmful:'))).toBe(
-      true,
-    );
-    expect(result.plugins?.every((p: RedteamPluginObject) => p.numTests === 5)).toBe(true);
-  });
+  it('should expand harmful plugin to all harm categories', verifyHarmfulPluginExpansion);
 
   it('should expand foundation plugin to all foundation plugins', () => {
     const result = RedteamConfigSchema.parse({

@@ -18,33 +18,41 @@ import { listCommand } from './commands/list';
 import { logsCommand } from './commands/logs';
 import { mcpCommand } from './commands/mcp/index';
 import { modelScanCommand } from './commands/modelScan';
+import { optimizeCommand } from './commands/optimize';
+import { initCommand as redteamInitCommand } from './commands/redteam/init';
+import { redteamReportCommand } from './commands/redteam/report';
+import { redteamSetupCommand } from './commands/redteam/setup';
 import { setupRetryCommand } from './commands/retry';
 import { shareCommand } from './commands/share';
 import { showCommand } from './commands/show';
 import { validateCommand } from './commands/validate';
 import { viewCommand } from './commands/view';
+import { EmailValidationError } from './globalConfig/accounts';
 import logger, { initializeRunLogging } from './logger';
 import {
   addCommonOptionsRecursively,
   isMainModule,
   setupEnvFilesFromArgv,
+  shouldSkipDefaultConfigLoading,
   shutdownGracefully,
 } from './mainUtils';
 import { runDbMigrations } from './migrate';
+import { EvalRunError } from './node/doEval';
 import { discoverCommand as redteamDiscoverCommand } from './redteam/commands/discover';
 import { redteamGenerateCommand } from './redteam/commands/generate';
-import { initCommand as redteamInitCommand } from './redteam/commands/init';
 import { pluginsCommand as redteamPluginsCommand } from './redteam/commands/plugins';
-import { redteamReportCommand } from './redteam/commands/report';
 import { redteamRunCommand } from './redteam/commands/run';
-import { redteamSetupCommand } from './redteam/commands/setup';
+import { ServerError } from './server/errors';
 import { checkForUpdates } from './updates';
 import { loadDefaultConfig } from './util/config/default';
+import { ConfigResolutionError, logConfigResolutionError } from './util/config/load';
 import { printErrorInformation } from './util/errors/index';
+import { formatLibsqlBindingErrorMessage } from './util/libsqlBindingErrors';
 import { VERSION } from './version';
 
 async function main() {
-  setupEnvFilesFromArgv();
+  const argv = process.argv.slice(2);
+  setupEnvFilesFromArgv(argv);
   initializeRunLogging();
 
   // Set PROMPTFOO_DISABLE_UPDATE=true in CI to prevent hanging on network requests
@@ -53,9 +61,12 @@ async function main() {
   }
 
   await checkForUpdates();
-  await runDbMigrations();
+  await runDbMigrations({ suppressBindingErrorLogging: true });
 
-  const { defaultConfig, defaultConfigPath } = await loadDefaultConfig();
+  const skipDefaultConfigLoading = shouldSkipDefaultConfigLoading(argv);
+  const { defaultConfig, defaultConfigPath } = skipDefaultConfigLoading
+    ? { defaultConfig: {}, defaultConfigPath: undefined }
+    : await loadDefaultConfig();
 
   const program = new Command('promptfoo');
   program
@@ -96,6 +107,7 @@ async function main() {
   listCommand(program);
   logsCommand(program);
   modelScanCommand(program);
+  optimizeCommand(program, defaultConfig, defaultConfigPath);
   setupRetryCommand(program);
   validateCommand(program, defaultConfig, defaultConfigPath);
   void showCommand(program);
@@ -105,7 +117,9 @@ async function main() {
   redteamGenerateCommand(generateCommand, 'redteam', defaultConfig, defaultConfigPath);
 
   const { defaultConfig: redteamConfig, defaultConfigPath: redteamConfigPath } =
-    await loadDefaultConfig(undefined, 'redteam');
+    skipDefaultConfigLoading
+      ? { defaultConfig: {}, defaultConfigPath: undefined }
+      : await loadDefaultConfig(undefined, 'redteam');
 
   redteamInitCommand(redteamBaseCommand);
   evalCommand(
@@ -145,12 +159,24 @@ try {
 
 if (isMain) {
   let mainError: unknown;
+  let libsqlBindingErrorMessage: string | undefined;
   try {
     await main();
   } catch (error) {
     mainError = error;
-    // Set exit code immediately so watchdog timeouts preserve the error state
-    process.exitCode = 1;
+    if (error instanceof ConfigResolutionError) {
+      logConfigResolutionError(error);
+    }
+    libsqlBindingErrorMessage = formatLibsqlBindingErrorMessage(error);
+    if (libsqlBindingErrorMessage) {
+      logger.debug('libsql platform binding missing (original error follows)', {
+        error: error instanceof Error ? (error.stack ?? error.message) : String(error),
+      });
+    }
+    // Set exit code immediately so watchdog timeouts preserve the error state.
+    // EvalRunError carries an explicit exit code (defaults to 1) so library
+    // callers and CLI wrappers see the same outcome.
+    process.exitCode = error instanceof EvalRunError ? error.exitCode : 1;
   } finally {
     try {
       await shutdownGracefully();
@@ -161,8 +187,22 @@ if (isMain) {
       );
     }
   }
-  // Re-throw the original error after cleanup is complete
+  // ConfigResolutionError / EmailValidationError / ServerError / EvalRunError
+  // already rendered a user-facing message before reaching this boundary;
+  // everything else is unexpected and bubbles up.
   if (mainError) {
-    throw mainError;
+    if (
+      mainError instanceof ConfigResolutionError ||
+      mainError instanceof EmailValidationError ||
+      mainError instanceof ServerError ||
+      mainError instanceof EvalRunError
+    ) {
+      // User-facing message has already been rendered.
+    } else if (libsqlBindingErrorMessage) {
+      console.error(libsqlBindingErrorMessage);
+      // exit code preserved by process.exitCode = 1 above
+    } else {
+      throw mainError;
+    }
   }
 }

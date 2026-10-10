@@ -211,6 +211,7 @@ promptfoo scan-model models/ --exclude-scanner weight_distribution
 # Strict mode with additional output options
 promptfoo scan-model models/ \
   --strict \
+  --no-write \
   --format sarif \
   --output security-scan.sarif
 ```
@@ -271,7 +272,7 @@ jobs:
           pip install modelaudit[all]
 
       - name: Scan models
-        run: promptfoo scan-model models/ --format sarif --output model-scan.sarif
+        run: promptfoo scan-model models/ --no-write --format sarif --output model-scan.sarif
 
       - name: Upload SARIF to GitHub Advanced Security
         uses: github/codeql-action/upload-sarif@v3
@@ -298,8 +299,11 @@ model_security_scan:
   script:
     - pip install modelaudit[all]
     - npm install -g promptfoo
-    - promptfoo scan-model models/ --format json --output scan-results.json
-    - if grep -q '"severity":"critical"' scan-results.json; then echo "Critical security issues found!"; exit 1; fi
+    - |
+      scan_status=0
+      promptfoo scan-model models/ --format json --output scan-results.json || scan_status=$?
+      if [ "$scan_status" -gt 1 ]; then exit "$scan_status"; fi
+    - jq -e '[.issues[]? | select(.severity == "critical")] | length == 0' scan-results.json
   artifacts:
     paths:
       - scan-results.json
@@ -364,46 +368,20 @@ results = scan_model_directory_or_file("path/to/models/", **config)
 
 When using `--format json`, ModelAudit outputs structured results:
 
-```json
-{
-  "scanner_names": ["pickle"],
-  "start_time": 1750168822.481906,
-  "bytes_scanned": 74,
-  "issues": [
-    {
-      "message": "Found REDUCE opcode - potential __reduce__ method execution",
-      "severity": "warning",
-      "location": "evil.pickle (pos 71)",
-      "details": {
-        "position": 71,
-        "opcode": "REDUCE"
-      },
-      "timestamp": 1750168822.482304
-    },
-    {
-      "message": "Suspicious module reference found: posix.system",
-      "severity": "critical",
-      "location": "evil.pickle (pos 28)",
-      "details": {
-        "module": "posix",
-        "function": "system",
-        "position": 28,
-        "opcode": "STACK_GLOBAL"
-      },
-      "timestamp": 1750168822.482378,
-      "why": "The 'os' module provides direct access to operating system functions."
-    }
-  ],
-  "has_errors": false,
-  "files_scanned": 1,
-  "duration": 0.0005328655242919922,
-  "assets": [
-    {
-      "path": "evil.pickle",
-      "type": "pickle"
-    }
-  ]
-}
+```bash
+promptfoo scan-model model.pkl --format json --output results.json
+```
+
+Use the [ModelAudit JSON Schema](/schemas/modelaudit/modelaudit-scan-result.schema.json) and [example result](/examples/modelaudit/modelaudit-scan-result.example.json) to validate `--format json` output.
+
+The result includes scan statistics, scanned assets, file metadata, `issues`, and `checks`. Treat `issues` as findings. `checks` records performed checks and may include a failed check for the same finding, so do not count both arrays as separate findings.
+
+Consumers should tolerate omitted optional fields and new scanner-specific fields, especially within `details` and `file_metadata`.
+
+Use the standalone ModelAudit CLI to export the installed version's scanner catalog when you need the current scanner IDs and dependency metadata:
+
+```bash
+modelaudit scan --list-scanners --format json
 ```
 
 ## SARIF Output Format
@@ -415,10 +393,10 @@ ModelAudit supports SARIF (Static Analysis Results Interchange Format) 2.1.0 out
 promptfoo scan-model model.pkl --format sarif
 
 # Save SARIF to file
-promptfoo scan-model model.pkl --format sarif --output results.sarif
+promptfoo scan-model model.pkl --no-write --format sarif --output results.sarif
 
 # Scan multiple models with SARIF output
-promptfoo scan-model models/ --format sarif --output scan-results.sarif
+promptfoo scan-model models/ --no-write --format sarif --output scan-results.sarif
 ```
 
 ### SARIF Structure
@@ -496,13 +474,20 @@ SARIF output enables integration with:
 ```yaml
 # .github/workflows/security.yml
 - name: Scan models
-  run: promptfoo scan-model models/ --format sarif --output model-scan.sarif
+  id: scan
+  continue-on-error: true
+  run: promptfoo scan-model models/ --no-write --format sarif --output model-scan.sarif
 
 - name: Upload SARIF to GitHub
+  if: always()
   uses: github/codeql-action/upload-sarif@v3
   with:
     sarif_file: model-scan.sarif
     category: model-security
+
+- name: Fail if scan found issues or errors
+  if: steps.scan.outcome == 'failure'
+  run: exit 1
 ```
 
 #### Azure DevOps
@@ -510,7 +495,7 @@ SARIF output enables integration with:
 ```yaml
 # azure-pipelines.yml
 - script: |
-    promptfoo scan-model models/ --format sarif --output $(Build.ArtifactStagingDirectory)/model-scan.sarif
+    promptfoo scan-model models/ --no-write --format sarif --output $(Build.ArtifactStagingDirectory)/model-scan.sarif
   displayName: 'Scan models'
 
 - task: PublishSecurityAnalysisLogs@3
@@ -525,7 +510,7 @@ SARIF output enables integration with:
 
 ```bash
 # Generate SARIF for local viewing
-promptfoo scan-model . --format sarif --output scan.sarif
+promptfoo scan-model . --no-write --format sarif --output scan.sarif
 
 # Open in VS Code with SARIF Viewer extension
 code scan.sarif
@@ -628,6 +613,7 @@ class CustomModelScanner(BaseScanner):
     def scan(self, path: str) -> ScanResult:
         """Scan the model file for security issues"""
         result = self._create_result()
+        scan_success = True
 
         try:
             # Your custom scanning logic here
@@ -649,8 +635,9 @@ class CustomModelScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e)}
             )
+            scan_success = False
 
-        result.finish(success=True)
+        result.finish(success=scan_success)
         return result
 ```
 

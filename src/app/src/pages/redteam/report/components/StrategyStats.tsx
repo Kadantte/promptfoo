@@ -3,13 +3,12 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Badge } from '@app/components/ui/badge';
 import { Card, CardContent } from '@app/components/ui/card';
 import { Sheet, SheetContent, SheetTitle } from '@app/components/ui/sheet';
-import { Spinner } from '@app/components/ui/spinner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@app/components/ui/tabs';
 import { useCustomPoliciesMap } from '@app/hooks/useCustomPoliciesMap';
 import { cn } from '@app/lib/utils';
 import { formatASRForDisplay } from '@app/utils/redteam';
+import { calculateAttackSuccessRate } from '@promptfoo/presentation/redteamMetrics';
 import { displayNameOverrides, subCategoryDescriptions } from '@promptfoo/redteam/constants';
-import { calculateAttackSuccessRate } from '@promptfoo/redteam/metrics';
 import { type RedteamPluginObject } from '@promptfoo/redteam/types';
 import { compareByASRDescending } from '../utils/utils';
 import { type CategoryStats, type TestResultStats } from './FrameworkComplianceUtils';
@@ -51,66 +50,41 @@ const DrawerContent = ({
 }) => {
   const customPoliciesById = useCustomPoliciesMap(plugins);
 
-  const pluginStats = useMemo(() => {
+  const { pluginStats, examplesByStrategy } = useMemo(() => {
     const pluginStats: Record<string, { successfulAttacks: number; total: number }> = {};
+    const failures: TestWithMetadata[] = [];
+    const passes: TestWithMetadata[] = [];
 
-    Object.entries(failedAttacksByPlugin).forEach(([plugin, tests]) => {
-      tests.forEach((test) => {
-        const testStrategy = getStrategyIdFromTest(test);
-        if (testStrategy === selectedStrategy) {
-          if (!pluginStats[plugin]) {
-            pluginStats[plugin] = { successfulAttacks: 0, total: 0 };
+    for (const [byPlugin, examples, successful] of [
+      [failedAttacksByPlugin, passes, false],
+      [succeededAttacksByPlugin, failures, true],
+    ] as const) {
+      Object.entries(byPlugin).forEach(([plugin, tests]) => {
+        tests.forEach((test) => {
+          if (getStrategyIdFromTest(test) === selectedStrategy) {
+            if (!pluginStats[plugin]) {
+              pluginStats[plugin] = { successfulAttacks: 0, total: 0 };
+            }
+            if (successful) {
+              pluginStats[plugin].successfulAttacks++;
+            }
+            pluginStats[plugin].total++;
+            examples.push(test);
           }
-          pluginStats[plugin].total++;
-        }
+        });
       });
-    });
+    }
 
-    Object.entries(succeededAttacksByPlugin).forEach(([plugin, tests]) => {
-      tests.forEach((test) => {
-        const testStrategy = getStrategyIdFromTest(test);
-        if (testStrategy === selectedStrategy) {
-          if (!pluginStats[plugin]) {
-            pluginStats[plugin] = { successfulAttacks: 0, total: 0 };
-          }
-          pluginStats[plugin].successfulAttacks++;
-          pluginStats[plugin].total++;
-        }
-      });
-    });
-
-    return Object.entries(pluginStats)
-      .map(([plugin, stats]) => ({
-        plugin,
-        ...stats,
-        asr: calculateAttackSuccessRate(stats.total, stats.successfulAttacks),
-      }))
-      .sort(compareByASRDescending);
-  }, [succeededAttacksByPlugin, failedAttacksByPlugin, selectedStrategy]);
-
-  const examplesByStrategy = useMemo(() => {
-    const failures: (typeof succeededAttacksByPlugin)[string] = [];
-    const passes: (typeof failedAttacksByPlugin)[string] = [];
-
-    Object.values(succeededAttacksByPlugin).forEach((tests) => {
-      tests.forEach((test) => {
-        const testStrategy = getStrategyIdFromTest(test);
-        if (testStrategy === selectedStrategy) {
-          failures.push(test);
-        }
-      });
-    });
-
-    Object.values(failedAttacksByPlugin).forEach((tests) => {
-      tests.forEach((test) => {
-        const testStrategy = getStrategyIdFromTest(test);
-        if (testStrategy === selectedStrategy) {
-          passes.push(test);
-        }
-      });
-    });
-
-    return { failures, passes };
+    return {
+      pluginStats: Object.entries(pluginStats)
+        .map(([plugin, stats]) => ({
+          plugin,
+          ...stats,
+          asr: calculateAttackSuccessRate(stats.total, stats.successfulAttacks),
+        }))
+        .sort(compareByASRDescending),
+      examplesByStrategy: { failures, passes },
+    };
   }, [succeededAttacksByPlugin, failedAttacksByPlugin, selectedStrategy]);
 
   const getPromptDisplayString = (prompt: string): string => {
@@ -231,10 +205,12 @@ const DrawerContent = ({
               <th className="px-4 py-3 text-right font-medium text-muted-foreground">
                 Attack Success Rate
               </th>
-              <th className="px-4 py-3 text-right font-medium text-muted-foreground">
+              <th className="hidden px-4 py-3 text-right font-medium text-muted-foreground sm:table-cell">
                 # Flagged Attempts
               </th>
-              <th className="px-4 py-3 text-right font-medium text-muted-foreground"># Attempts</th>
+              <th className="hidden px-4 py-3 text-right font-medium text-muted-foreground sm:table-cell">
+                # Attempts
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
@@ -243,13 +219,20 @@ const DrawerContent = ({
               return (
                 <tr key={stat.plugin} className="hover:bg-muted/30">
                   <td className="px-4 py-3 font-medium">
-                    {customPolicy?.name ??
-                      (displayNameOverrides[stat.plugin as keyof typeof displayNameOverrides] ||
-                        stat.plugin)}
+                    <div>
+                      {customPolicy?.name ??
+                        (displayNameOverrides[stat.plugin as keyof typeof displayNameOverrides] ||
+                          stat.plugin)}
+                    </div>
+                    <div className="mt-1 text-xs font-normal text-muted-foreground sm:hidden">
+                      {stat.total - stat.successfulAttacks} flagged / {stat.total} attempts
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-right">{formatASRForDisplay(stat.asr)}%</td>
-                  <td className="px-4 py-3 text-right">{stat.total - stat.successfulAttacks}</td>
-                  <td className="px-4 py-3 text-right">{stat.total}</td>
+                  <td className="hidden px-4 py-3 text-right sm:table-cell">
+                    {stat.total - stat.successfulAttacks}
+                  </td>
+                  <td className="hidden px-4 py-3 text-right sm:table-cell">{stat.total}</td>
                 </tr>
               );
             })}
@@ -259,11 +242,17 @@ const DrawerContent = ({
 
       {/* Tabs */}
       <Tabs value={tabValue} onValueChange={onTabChange} className="mt-4">
-        <TabsList className="w-full">
-          <TabsTrigger value="flagged" className="flex-1">
+        <TabsList className="h-auto w-full">
+          <TabsTrigger
+            value="flagged"
+            className="min-h-10 flex-1 whitespace-normal px-2 text-center text-xs leading-tight sm:text-sm"
+          >
             Flagged Attempts ({selectedStrategyStats.pass})
           </TabsTrigger>
-          <TabsTrigger value="successful" className="flex-1">
+          <TabsTrigger
+            value="successful"
+            className="min-h-10 flex-1 whitespace-normal px-2 text-center text-xs leading-tight sm:text-sm"
+          >
             Successful Attacks ({selectedStrategyStats.failCount})
           </TabsTrigger>
         </TabsList>
@@ -338,7 +327,7 @@ const StrategySheet = ({
     <Sheet open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <SheetContent
         side="right"
-        className="flex w-[750px] flex-col p-0 sm:max-w-[750px]"
+        className="flex w-full flex-col p-0 sm:w-[750px] sm:max-w-[750px]"
         aria-describedby={undefined}
       >
         <SheetTitle className="sr-only">
@@ -378,8 +367,6 @@ const StrategyStats = ({
   plugins: RedteamPluginObject[];
 }) => {
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<Error | null>(null);
 
   /**
    * Sort strategies by ASR (highest first)
@@ -390,39 +377,7 @@ const StrategyStats = ({
     return compareByASRDescending({ asr: asrA }, { asr: asrB });
   });
 
-  const handleStrategyClick = async (strategy: string) => {
-    try {
-      setIsLoading(true);
-      setSelectedStrategy(strategy);
-      // ... any async operations
-    } catch (err) {
-      setError(err instanceof Error ? err : new Error('Unknown error'));
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleDrawerClose = () => {
-    setSelectedStrategy(null);
-  };
-
   const [tabValue, setTabValue] = useState('flagged');
-
-  if (error) {
-    return (
-      <div className="p-4">
-        <p className="text-destructive">Error loading strategy stats: {error.message}</p>
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center p-4">
-        <Spinner />
-      </div>
-    );
-  }
 
   return (
     <>
@@ -433,7 +388,7 @@ const StrategyStats = ({
       >
         <CardContent className="p-6">
           <h2 className="mb-4 text-xl font-semibold">Attack Methods</h2>
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-[repeat(auto-fill,minmax(300px,1fr))]">
             {strategies.map(([strategy, { total, failCount }]) => {
               const asr = calculateAttackSuccessRate(total, failCount);
               return (
@@ -444,10 +399,10 @@ const StrategyStats = ({
                   aria-label={`View details for ${strategy} attack method`}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
-                      handleStrategyClick(strategy);
+                      setSelectedStrategy(strategy);
                     }
                   }}
-                  onClick={() => handleStrategyClick(strategy)}
+                  onClick={() => setSelectedStrategy(strategy)}
                   className={cn(
                     'cursor-pointer rounded-lg p-4 transition-all',
                     'hover:bg-muted/50',
@@ -489,7 +444,9 @@ const StrategyStats = ({
       <StrategySheet
         selectedStrategy={selectedStrategy}
         isOpen={!!selectedStrategy}
-        onClose={handleDrawerClose}
+        onClose={() => {
+          setSelectedStrategy(null);
+        }}
         tabValue={tabValue}
         onTabChange={(newValue) => setTabValue(newValue)}
         failuresByPlugin={failuresByPlugin}

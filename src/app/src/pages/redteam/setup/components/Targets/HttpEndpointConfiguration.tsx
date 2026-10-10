@@ -1,6 +1,6 @@
 import './syntax-highlighting.css';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { Button } from '@app/components/ui/button';
 import Editor from '@app/components/ui/code-editor';
@@ -28,10 +28,10 @@ import {
   SelectValue,
 } from '@app/components/ui/select';
 import { Switch } from '@app/components/ui/switch';
-import Prism from '@app/lib/prism';
+import { highlightJS } from '@app/lib/codeHighlight';
 import { cn } from '@app/lib/utils';
 import { callApi } from '@app/utils/api';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import {
   AlignLeft,
   Check,
@@ -60,6 +60,7 @@ interface HttpEndpointConfigurationProps {
   setUrlError: (error: string | null) => void;
   onTargetTested?: (success: boolean) => void;
   onSessionTested?: (success: boolean) => void;
+  isTargetConfigInvalid?: () => boolean;
 }
 
 interface GeneratedConfig {
@@ -76,18 +77,6 @@ interface GeneratedConfig {
   };
 }
 
-const highlightJS = (code: string): string => {
-  try {
-    const grammar = Prism?.languages?.javascript;
-    if (!grammar) {
-      return code;
-    }
-    return Prism.highlight(code, grammar, 'javascript');
-  } catch {
-    return code;
-  }
-};
-
 const HttpEndpointConfiguration = ({
   selectedTarget,
   updateCustomTarget,
@@ -97,6 +86,7 @@ const HttpEndpointConfiguration = ({
   setUrlError,
   onTargetTested,
   onSessionTested,
+  isTargetConfigInvalid,
 }: HttpEndpointConfigurationProps): React.ReactElement => {
   const [requestBody, setRequestBody] = useState(
     typeof selectedTarget.config.body === 'string'
@@ -152,15 +142,28 @@ Content-Type: application/json
 
   // Request body type (json or text)
   const [requestBodyType, setRequestBodyType] = useState<'json' | 'text'>('json');
+  const targetUrl =
+    (typeof selectedTarget.config.url === 'string' && selectedTarget.config.url.trim()) ||
+    (/^https?:\/\//i.test(selectedTarget.id) ? selectedTarget.id : undefined);
+  const [urlInput, setUrlInput] = useState(() => targetUrl ?? '');
+  const isUrlInputFocused = useRef(false);
+  useEffect(() => {
+    if (!isUrlInputFocused.current) {
+      setUrlInput(targetUrl ?? '');
+    }
+  }, [targetUrl]);
 
   // Handle test target
   const handleTestTarget = useCallback(async () => {
+    if (isTargetConfigInvalid?.()) {
+      onTargetTested?.(false);
+      return;
+    }
     setIsTestRunning(true);
     setTestResult(null);
 
     // Validate URL before testing (skip validation for raw request mode)
     if (!selectedTarget.config?.request) {
-      const targetUrl = selectedTarget.config?.url;
       if (!targetUrl || targetUrl.trim() === '' || targetUrl === 'http') {
         setTestResult({
           success: false,
@@ -238,7 +241,7 @@ Content-Type: application/json
     } finally {
       setIsTestRunning(false);
     }
-  }, [selectedTarget, onTargetTested]);
+  }, [selectedTarget, onTargetTested, targetUrl, isTargetConfigInvalid]);
 
   // Auto-size the raw request textarea between 10rem and 40rem based on line count
   const computeRawTextareaHeight = useCallback((text: string) => {
@@ -529,7 +532,7 @@ ${exampleRequest}`;
 
   return (
     <div className="min-w-0">
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-2">
           <Switch
             id="use-raw-request"
@@ -596,12 +599,12 @@ ${exampleRequest}`;
               <Label htmlFor="url">
                 URL <span className="text-destructive">*</span>
               </Label>
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <Select
                   value={selectedTarget.config.method}
                   onValueChange={(value) => updateCustomTarget('method', value)}
                 >
-                  <SelectTrigger id="method" className="w-24 shrink-0">
+                  <SelectTrigger id="method" className="w-full sm:w-24 sm:shrink-0">
                     <SelectValue placeholder="Method" />
                   </SelectTrigger>
                   <SelectContent>
@@ -614,9 +617,19 @@ ${exampleRequest}`;
                 </Select>
                 <Input
                   id="url"
-                  value={selectedTarget.config.url}
-                  onChange={(e) => updateCustomTarget('url', e.target.value)}
-                  className={cn('flex-1', urlError && 'border-destructive')}
+                  value={urlInput}
+                  onChange={(e) => {
+                    setUrlInput(e.target.value);
+                    updateCustomTarget('url', e.target.value);
+                  }}
+                  onFocus={() => {
+                    isUrlInputFocused.current = true;
+                  }}
+                  onBlur={() => {
+                    isUrlInputFocused.current = false;
+                    setUrlInput(targetUrl ?? '');
+                  }}
+                  className={cn('min-w-0 flex-1', urlError && 'border-destructive')}
                   placeholder="https://example.com/api/chat"
                 />
               </div>
@@ -625,7 +638,10 @@ ${exampleRequest}`;
 
             <p className="mb-2 mt-6 font-medium">Headers</p>
             {headers.map(({ key, value }, index) => (
-              <div key={index} className="mb-2 flex items-center gap-2">
+              <div
+                key={index}
+                className="mb-2 flex flex-col items-stretch gap-2 sm:flex-row sm:items-center"
+              >
                 <Input
                   value={key}
                   onChange={(e) => updateHeaderKey(index, e.target.value)}
@@ -638,7 +654,13 @@ ${exampleRequest}`;
                   placeholder="Value"
                   className="flex-1"
                 />
-                <Button variant="ghost" size="icon" onClick={() => removeHeader(index)}>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Remove header ${index + 1}`}
+                  onClick={() => removeHeader(index)}
+                  className="self-end sm:self-auto"
+                >
                   <Trash2 className="size-4" />
                 </Button>
               </div>
@@ -795,6 +817,7 @@ ${exampleRequest}`;
             variant="outline"
             size="sm"
             onClick={() => setResponseTestOpen(true)}
+            disabled={isTargetConfigInvalid?.()}
             className="absolute right-2 top-2 z-10"
           >
             <Play className="mr-1 size-4" />
@@ -809,9 +832,8 @@ ${exampleRequest}`;
           testResult={testResult}
           handleTestTarget={handleTestTarget}
           disabled={
-            selectedTarget.config.request
-              ? !selectedTarget.config.request
-              : !selectedTarget.config.url
+            Boolean(isTargetConfigInvalid?.()) ||
+            (selectedTarget.config.request ? !selectedTarget.config.request : !targetUrl)
           }
           detailsExpanded={testDetailsExpanded}
           onDetailsExpandedChange={setTestDetailsExpanded}
@@ -819,77 +841,24 @@ ${exampleRequest}`;
       </div>
 
       <Dialog open={configDialogOpen} onOpenChange={setConfigDialogOpen}>
-        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-4xl">
+        <DialogContent className="flex max-h-[90vh] flex-col overflow-hidden sm:max-w-4xl">
           <DialogHeader>
             <DialogTitle>Generate HTTP Configuration</DialogTitle>
           </DialogHeader>
-          <p className="mb-2 text-sm text-muted-foreground">
-            Paste an example HTTP request and optionally a response. Promptfoo will automatically
-            generate the configuration for you.
-          </p>
-          <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div>
-              <p className="mb-2 text-lg font-semibold">
-                Example Request (paste your HTTP request here)
-              </p>
-              <div className="h-[300px] overflow-auto rounded-lg border border-border bg-muted/30 dark:bg-zinc-900">
-                <Editor
-                  value={request}
-                  onValueChange={(val) => setRequest(val)}
-                  highlight={(code) => code}
-                  padding={10}
-                  style={{
-                    fontFamily: '"Fira code", "Fira Mono", monospace',
-                    fontSize: 14,
-                    minHeight: '100%',
-                  }}
-                />
-              </div>
-            </div>
-            <div>
-              <p className="mb-2 text-lg font-semibold">
-                Example Response (optional, improves accuracy)
-              </p>
-              <div className="h-[300px] overflow-auto rounded-lg border border-border bg-muted/30 dark:bg-zinc-900">
-                <Editor
-                  value={response}
-                  onValueChange={(val) => setResponse(val)}
-                  highlight={(code) => code}
-                  padding={10}
-                  style={{
-                    fontFamily: '"Fira code", "Fira Mono", monospace',
-                    fontSize: 14,
-                    minHeight: '100%',
-                  }}
-                />
-              </div>
-            </div>
-            {error && (
-              <div className="col-span-2">
-                <p className="text-destructive">Error: {error}</p>
-              </div>
-            )}
-            {generatedConfig && (
-              <div className="col-span-2">
-                <div className="mb-2 mt-4 flex items-center">
-                  <p className="flex-1 text-lg font-semibold">Generated Configuration</p>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={handleCopy}
-                    title={copied ? 'Copied!' : 'Copy to clipboard'}
-                  >
-                    {copied ? (
-                      <Check className="size-4 text-emerald-600" />
-                    ) : (
-                      <Copy className="size-4" />
-                    )}
-                  </Button>
-                </div>
-                <div className="h-80 overflow-auto rounded-lg border border-border bg-muted/30 dark:bg-zinc-900">
+          <div className="min-h-0 flex-1 overflow-y-auto py-4">
+            <p className="mb-2 text-sm text-muted-foreground">
+              Paste an example HTTP request and optionally a response. Promptfoo will automatically
+              generate the configuration for you.
+            </p>
+            <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+              <div>
+                <p className="mb-2 text-lg font-semibold">
+                  Example Request (paste your HTTP request here)
+                </p>
+                <div className="h-[300px] overflow-auto rounded-lg border border-border bg-muted/30 dark:bg-zinc-900">
                   <Editor
-                    value={yaml.dump(generatedConfig.config)}
-                    onValueChange={() => {}} // Read-only
+                    value={request}
+                    onValueChange={(val) => setRequest(val)}
                     highlight={(code) => code}
                     padding={10}
                     style={{
@@ -897,13 +866,69 @@ ${exampleRequest}`;
                       fontSize: 14,
                       minHeight: '100%',
                     }}
-                    readOnly
                   />
                 </div>
               </div>
-            )}
+              <div>
+                <p className="mb-2 text-lg font-semibold">
+                  Example Response (optional, improves accuracy)
+                </p>
+                <div className="h-[300px] overflow-auto rounded-lg border border-border bg-muted/30 dark:bg-zinc-900">
+                  <Editor
+                    value={response}
+                    onValueChange={(val) => setResponse(val)}
+                    highlight={(code) => code}
+                    padding={10}
+                    style={{
+                      fontFamily: '"Fira code", "Fira Mono", monospace',
+                      fontSize: 14,
+                      minHeight: '100%',
+                    }}
+                  />
+                </div>
+              </div>
+              {error && (
+                <div className="col-span-2">
+                  <p className="text-destructive">Error: {error}</p>
+                </div>
+              )}
+              {generatedConfig && (
+                <div className="col-span-2">
+                  <div className="mb-2 mt-4 flex items-center">
+                    <p className="flex-1 text-lg font-semibold">Generated Configuration</p>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Copy generated configuration"
+                      onClick={handleCopy}
+                      title={copied ? 'Copied!' : 'Copy to clipboard'}
+                    >
+                      {copied ? (
+                        <Check className="size-4 text-emerald-600" />
+                      ) : (
+                        <Copy className="size-4" />
+                      )}
+                    </Button>
+                  </div>
+                  <div className="h-80 overflow-auto rounded-lg border border-border bg-muted/30 dark:bg-zinc-900">
+                    <Editor
+                      value={yaml.dump(generatedConfig.config)}
+                      onValueChange={() => {}} // Read-only
+                      highlight={(code) => code}
+                      padding={10}
+                      style={{
+                        fontFamily: '"Fira code", "Fira Mono", monospace',
+                        fontSize: 14,
+                        minHeight: '100%',
+                      }}
+                      readOnly
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
-          <DialogFooter className="mt-4 gap-2">
+          <DialogFooter className="mt-4 shrink-0 gap-2">
             <Button variant="outline" onClick={() => setConfigDialogOpen(false)}>
               Cancel
             </Button>
@@ -931,6 +956,7 @@ ${exampleRequest}`;
         updateCustomTarget={updateCustomTarget}
         defaultRequestTransform={selectedTarget.config.transformRequest}
         onSessionTested={onSessionTested}
+        isTargetConfigInvalid={isTargetConfigInvalid}
       />
 
       {/* Response Transform Test Dialog */}
@@ -939,6 +965,7 @@ ${exampleRequest}`;
         onClose={() => setResponseTestOpen(false)}
         currentTransform={selectedTarget.config.transformResponse || ''}
         onApply={(code) => updateCustomTarget('transformResponse', code)}
+        isTargetConfigInvalid={isTargetConfigInvalid}
       />
     </div>
   );

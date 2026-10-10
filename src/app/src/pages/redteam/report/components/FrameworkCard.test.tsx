@@ -7,8 +7,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import FrameworkCard from './FrameworkCard';
 import { type CategoryStats } from './FrameworkComplianceUtils';
 
-// Mock react-router-dom
-vi.mock('react-router-dom', () => ({
+// Mock react-router
+vi.mock('react-router', () => ({
   useNavigate: vi.fn(),
 }));
 
@@ -125,6 +125,11 @@ describe('FrameworkCard', () => {
     // Verify OWASP API category names are displayed (from OWASP_API_TOP_10_NAMES)
     // These plugins appear in categories 1, 2, and 5
     expect(screen.getByText(/Broken Object Level Authorization/)).toBeInTheDocument();
+
+    expect(screen.getByText(/Broken Object Level Authorization/).parentElement).toHaveClass(
+      'flex-col',
+      'sm:flex-row',
+    );
 
     // Verify plugins are displayed (some appear in multiple categories, so use getAllByText)
     expect(screen.getAllByText('bola').length).toBeGreaterThan(0);

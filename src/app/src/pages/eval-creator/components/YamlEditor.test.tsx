@@ -3,15 +3,22 @@ import React from 'react';
 import { mockClipboard, mockObjectUrl } from '@app/tests/browserMocks';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import YamlEditorComponent from './YamlEditor';
 
-vi.mock('react-router-dom', () => ({
+vi.mock('react-router', () => ({
   Link: ({ children, to }: { children: React.ReactNode; to: string }) => (
     <a href={to}>{children}</a>
   ),
 }));
+
+// js-yaml v5 is native ESM with a sealed namespace, so vi.spyOn cannot patch it.
+// Wrap dump in a spy-able mock that keeps the real implementation.
+vi.mock('js-yaml', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('js-yaml')>();
+  return { ...actual, dump: vi.fn(actual.dump) };
+});
 
 // Mock useToast
 const mockShowToast = vi.fn();
@@ -27,24 +34,27 @@ const mockGetTestSuite = vi.fn().mockReturnValue({
   prompts: ['test prompt'],
   tests: [{ description: 'test case' }],
 });
+const mockUpdateConfig = vi.fn();
 
 vi.mock('@app/stores/evalConfig', () => ({
   useStore: vi.fn(() => ({
     config: {}, // Mock config object
     getTestSuite: mockGetTestSuite,
-    updateConfig: vi.fn(),
+    updateConfig: mockUpdateConfig,
     setState: vi.fn(),
   })),
 }));
 
 // Mock the editor component to avoid prism.js issues
 vi.mock('react-simple-code-editor', () => ({
-  default: ({ value, onValueChange, disabled }: any) => (
+  default: ({ value, onValueChange, disabled, textareaId, ...props }: any) => (
     <textarea
       data-testid="yaml-editor"
+      id={textareaId}
       value={value}
       onChange={(e) => onValueChange(e.target.value)}
       disabled={disabled}
+      {...props}
     />
   ),
 }));
@@ -68,6 +78,7 @@ vi.mock('@mui/icons-material/Upload', () => ({
 describe('YamlEditor', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockUpdateConfig.mockReset();
     mockClipboard();
     mockObjectUrl('blob:yaml-editor-test');
 
@@ -95,6 +106,9 @@ describe('YamlEditor', () => {
 
     const editor = screen.getByTestId('yaml-editor') as HTMLTextAreaElement;
     expect(editor.disabled).toBe(false);
+    expect(editor).toHaveAccessibleName('YAML configuration editor');
+    expect(editor).toHaveAttribute('aria-keyshortcuts', 'Control+S Meta+S');
+    expect(screen.getByRole('button', { name: 'Copy YAML configuration' })).toBeInTheDocument();
   });
 
   it('downloads the current YAML when Download YAML is clicked', async () => {
@@ -110,17 +124,84 @@ describe('YamlEditor', () => {
     expect(mockShowToast).toHaveBeenCalledWith('Downloaded promptfooconfig.yaml', 'success');
   });
 
+  it('saves YAML with Control+S', async () => {
+    const user = userEvent.setup();
+    render(<YamlEditorComponent />);
+
+    const editor = screen.getByTestId('yaml-editor') as HTMLTextAreaElement;
+    await user.click(editor);
+    await user.keyboard('{Control>}a{/Control}');
+    await user.paste('description: Saved with shortcut');
+    await user.keyboard('{Control>}s{/Control}');
+
+    expect(mockShowToast).toHaveBeenCalledWith('Configuration saved successfully', 'success');
+    expect(screen.getByRole('button', { name: /Save/ })).toBeDisabled();
+  });
+
+  it('keeps invalid configuration unsaved and identifies the invalid field', async () => {
+    const user = userEvent.setup();
+    render(<YamlEditorComponent />);
+    const editor = screen.getByTestId('yaml-editor');
+    await user.click(editor);
+    await user.keyboard('{Control>}a{/Control}');
+    await user.paste('tracing:\n  enabled: incorrect-value');
+    await user.click(screen.getByRole('button', { name: /Save/ }));
+
+    expect(mockUpdateConfig).not.toHaveBeenCalled();
+    expect(mockShowToast).toHaveBeenCalledWith(expect.stringContaining('tracing.enabled'), 'error');
+    expect(screen.getByText(/Invalid YAML configuration at tracing.enabled/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Save/ })).toBeEnabled();
+  });
+
+  it('does not save a web draft whose local references depend on basePath', async () => {
+    const user = userEvent.setup();
+    render(<YamlEditorComponent />);
+    const editor = screen.getByTestId('yaml-editor');
+    await user.click(editor);
+    await user.keyboard('{Control>}a{/Control}');
+    await user.paste('basePath: /work/config\nprompts:\n  - file://prompt.txt');
+    await user.click(screen.getByRole('button', { name: /Save/ }));
+
+    expect(mockUpdateConfig).not.toHaveBeenCalled();
+    expect(screen.getByText(/basePath.*CLI/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Save/ })).toBeEnabled();
+  });
+
+  it('saves an incomplete configuration as entered without adding runtime defaults', async () => {
+    const user = userEvent.setup();
+    render(<YamlEditorComponent />);
+    const editor = screen.getByTestId('yaml-editor');
+    await user.click(editor);
+    await user.keyboard('{Control>}a{/Control}');
+    await user.paste('tracing:\n  otlp:\n    http: {}');
+    await user.click(screen.getByRole('button', { name: /Save/ }));
+
+    expect(mockUpdateConfig).toHaveBeenCalledWith({ tracing: { otlp: { http: {} } } });
+    expect(mockShowToast).toHaveBeenCalledWith('Configuration saved successfully', 'success');
+  });
+
+  it('uses the runtime provider alias for the form while keeping the entered YAML visible', async () => {
+    const user = userEvent.setup();
+    render(<YamlEditorComponent />);
+    const editor = screen.getByTestId('yaml-editor');
+    await user.click(editor);
+    await user.keyboard('{Control>}a{/Control}');
+    await user.paste('targets:\n  - echo');
+    await user.click(screen.getByRole('button', { name: /Save/ }));
+
+    expect(mockUpdateConfig).toHaveBeenCalledWith({ providers: ['echo'] });
+    expect(editor).toHaveValue('targets:\n  - echo');
+  });
+
   it('initializes with initialConfig', () => {
     const initialConfig = {
       description: 'Initial config',
       providers: [{ id: 'test-provider' }],
     };
 
-    const dumpSpy = vi.spyOn(yaml, 'dump');
-
     render(<YamlEditorComponent initialConfig={initialConfig} />);
 
-    expect(dumpSpy).toHaveBeenCalledWith(initialConfig);
+    expect(vi.mocked(yaml.dump)).toHaveBeenCalledWith(initialConfig);
   });
 
   it('includes evaluateOptions from store in YAML', () => {
@@ -198,6 +279,8 @@ describe('YamlEditor', () => {
     // Editor should still be rendered
     const editor = screen.getByTestId('yaml-editor') as HTMLTextAreaElement;
     expect(editor).toBeInTheDocument();
+    expect(editor).toHaveAccessibleName('YAML configuration preview');
+    expect(editor).not.toHaveAttribute('aria-keyshortcuts');
   });
 
   describe('handleCancel button state', () => {
@@ -268,7 +351,14 @@ describe('YamlEditor', () => {
       await user.paste('description: Modified content');
 
       // Unsaved changes indicator should appear
-      expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument();
+      const unsavedChanges = screen.getByText(/Unsaved changes/);
+
+      expect(unsavedChanges).toBeInTheDocument();
+      expect(unsavedChanges.parentElement).toHaveClass(
+        'flex-col',
+        'sm:flex-row',
+        'sm:items-center',
+      );
     });
 
     it('should disable both Save and Discard buttons after successful save', async () => {

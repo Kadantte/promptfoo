@@ -1,7 +1,7 @@
 import { TooltipProvider } from '@app/components/ui/tooltip';
 import { callApi } from '@app/utils/api';
 import { act, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useModelAuditConfigStore, useModelAuditHistoryStore } from '../model-audit/stores';
 import ModelAuditSetupPage from './ModelAuditSetupPage';
@@ -52,8 +52,8 @@ vi.mock('../model-audit/components/ScannedFilesDialog', () => ({
 }));
 
 const mockNavigate = vi.fn();
-vi.mock('react-router-dom', async () => {
-  const actual = await vi.importActual('react-router-dom');
+vi.mock('react-router', async () => {
+  const actual = await vi.importActual('react-router');
   return {
     ...actual,
     useNavigate: () => mockNavigate,
@@ -120,17 +120,11 @@ describe('ModelAuditSetupPage', () => {
     historyError: null,
     totalCount: 0,
     pageSize: 25,
-    currentPage: 0,
     sortModel: [{ field: 'createdAt', sort: 'desc' as const }],
-    searchQuery: '',
     fetchHistoricalScans: mockFetchHistoricalScans,
     fetchScanById: vi.fn(),
     deleteHistoricalScan: vi.fn(),
-    setPageSize: vi.fn(),
-    setCurrentPage: vi.fn(),
     setSortModel: vi.fn(),
-    setSearchQuery: vi.fn(),
-    resetFilters: vi.fn(),
   });
 
   beforeEach(() => {
@@ -160,6 +154,16 @@ describe('ModelAuditSetupPage', () => {
 
     expect(screen.getByText('Model Audit Setup')).toBeInTheDocument();
     expect(screen.getByTestId('config-tab')).toBeInTheDocument();
+  });
+
+  it('stacks the header status below the title group on narrow screens', () => {
+    renderComponent();
+
+    expect(screen.getByTestId('model-audit-header')).toHaveClass(
+      'flex-col',
+      'sm:flex-row',
+      'sm:justify-between',
+    );
   });
 
   it('should check installation on mount', async () => {
@@ -217,6 +221,10 @@ describe('ModelAuditSetupPage', () => {
     renderComponent();
 
     expect(screen.getByText('Something went wrong')).toBeInTheDocument();
+    expect(screen.getByText('Something went wrong').parentElement).toHaveClass(
+      'flex-col',
+      'sm:flex-row',
+    );
   });
 
   it('should show results tab when scan results are available', () => {

@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getCache, isCacheEnabled } from '../../src/cache';
 import {
@@ -5,7 +7,12 @@ import {
   cacheResponse,
   getCachedResponse,
   initializeAgenticCache,
+  isAgenticGradingProvider,
+  isAgenticProvider,
+  resolveAgenticWorkingDir,
 } from '../../src/providers/agentic-utils';
+
+import type { ApiProvider } from '../../src/types/index';
 
 vi.mock('../../src/cache');
 
@@ -26,6 +33,50 @@ describe('agentic-utils', () => {
     vi.resetAllMocks();
   });
 
+  describe('isAgenticProvider', () => {
+    const provider = (id: string): ApiProvider =>
+      ({
+        id: () => id,
+        callApi: vi.fn(),
+      }) as unknown as ApiProvider;
+
+    it.each([
+      'openai:codex-sdk',
+      'openai:codex-sdk:gpt-5.5',
+      'openai:codex-security',
+      'openai:codex-security:gpt-5.6-sol',
+      'openai:codex-app-server:gpt-5.5',
+      'openai:codex-desktop',
+      'anthropic:claude-agent-sdk',
+      'anthropic:claude-code:sonnet',
+      'openinterpreter',
+      'openinterpreter:gpt-5.4',
+      'opencode',
+      'opencode:sdk',
+    ])('recognizes %s as a coding-agent provider', (id) => {
+      expect(isAgenticProvider(provider(id))).toBe(true);
+    });
+
+    it('does not classify plain model providers as coding-agent runtimes', () => {
+      expect(isAgenticProvider(provider('openai:responses:gpt-5.5'))).toBe(false);
+      expect(isAgenticProvider(provider('anthropic:messages:claude-opus-4-6'))).toBe(false);
+    });
+
+    it('recognizes coding-agent runtimes that can return rubric grading verdicts', () => {
+      expect(isAgenticGradingProvider(provider('openai:codex-sdk'))).toBe(true);
+      expect(isAgenticGradingProvider(provider('anthropic:claude-agent-sdk'))).toBe(true);
+      expect(isAgenticGradingProvider(provider('openai:responses:gpt-5.5'))).toBe(false);
+    });
+
+    it.each(['openai:codex-security', 'openai:codex-security:gpt-5.6-sol'])(
+      'does not classify security scanner %s as a rubric grading provider',
+      (id) => {
+        expect(isAgenticProvider(provider(id))).toBe(true);
+        expect(isAgenticGradingProvider(provider(id))).toBe(false);
+      },
+    );
+  });
+
   describe('getCachedResponse', () => {
     it('should set cached: true flag when returning cached response', async () => {
       const mockCachedResponse = {
@@ -37,7 +88,6 @@ describe('agentic-utils', () => {
       mockCache.get = vi.fn().mockResolvedValue(JSON.stringify(mockCachedResponse));
 
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: true,
         shouldWriteCache: true,
         cache: mockCache as any,
@@ -56,7 +106,6 @@ describe('agentic-utils', () => {
 
     it('should return undefined when shouldReadCache is false', async () => {
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: false, // bustCache scenario
         shouldWriteCache: true,
         cache: mockCache as any,
@@ -71,7 +120,6 @@ describe('agentic-utils', () => {
 
     it('should return undefined when cache is not available', async () => {
       const cacheResult: CacheCheckResult = {
-        shouldCache: false,
         shouldReadCache: false,
         shouldWriteCache: false,
         cache: undefined,
@@ -85,7 +133,6 @@ describe('agentic-utils', () => {
 
     it('should return undefined when cache key is not available', async () => {
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: true,
         shouldWriteCache: true,
         cache: mockCache as any,
@@ -102,7 +149,6 @@ describe('agentic-utils', () => {
       mockCache.get = vi.fn().mockResolvedValue(null);
 
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: true,
         shouldWriteCache: true,
         cache: mockCache as any,
@@ -119,7 +165,6 @@ describe('agentic-utils', () => {
       mockCache.get = vi.fn().mockRejectedValue(new Error('Cache error'));
 
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: true,
         shouldWriteCache: true,
         cache: mockCache as any,
@@ -145,7 +190,6 @@ describe('agentic-utils', () => {
       mockCache.get = vi.fn().mockResolvedValue(JSON.stringify(mockCachedResponse));
 
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: true,
         shouldWriteCache: true,
         cache: mockCache as any,
@@ -172,7 +216,6 @@ describe('agentic-utils', () => {
       };
 
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: true,
         shouldWriteCache: true,
         cache: mockCache as any,
@@ -190,7 +233,6 @@ describe('agentic-utils', () => {
       };
 
       const cacheResult: CacheCheckResult = {
-        shouldCache: true,
         shouldReadCache: true,
         shouldWriteCache: false,
         cache: mockCache as any,
@@ -212,7 +254,6 @@ describe('agentic-utils', () => {
         { prompt: 'test prompt' },
       );
 
-      expect(result.shouldCache).toBe(false);
       expect(result.shouldReadCache).toBe(false);
       expect(result.shouldWriteCache).toBe(false);
       expect(result.cache).toBeUndefined();
@@ -227,7 +268,6 @@ describe('agentic-utils', () => {
         { prompt: 'test prompt' },
       );
 
-      expect(result.shouldCache).toBe(true);
       expect(result.shouldReadCache).toBe(true);
       expect(result.shouldWriteCache).toBe(true);
       expect(result.cache).toBeDefined();
@@ -243,7 +283,6 @@ describe('agentic-utils', () => {
         { prompt: 'test prompt' },
       );
 
-      expect(result.shouldCache).toBe(true);
       expect(result.shouldReadCache).toBe(false);
       expect(result.shouldWriteCache).toBe(true);
     });
@@ -256,7 +295,6 @@ describe('agentic-utils', () => {
         { prompt: 'test prompt' },
       );
 
-      expect(result.shouldCache).toBe(false);
       expect(result.shouldReadCache).toBe(false);
       expect(result.shouldWriteCache).toBe(false);
     });
@@ -269,7 +307,6 @@ describe('agentic-utils', () => {
         { prompt: 'test prompt' },
       );
 
-      expect(result.shouldCache).toBe(true);
       expect(result.shouldReadCache).toBe(true);
       expect(result.shouldWriteCache).toBe(true);
     });
@@ -290,6 +327,33 @@ describe('agentic-utils', () => {
       expect(resultA.cacheKey).toBeDefined();
       expect(resultB.cacheKey).toBeDefined();
       expect(resultA.cacheKey).not.toBe(resultB.cacheKey);
+    });
+  });
+
+  describe('resolveAgenticWorkingDir', () => {
+    it('should return undefined when no working directory is configured', () => {
+      expect(resolveAgenticWorkingDir(undefined, '/test/basePath')).toBeUndefined();
+    });
+
+    it('should resolve relative working directories from the config base path', () => {
+      expect(resolveAgenticWorkingDir('./workspace', '/test/basePath')).toBe(
+        path.resolve('/test/basePath', 'workspace'),
+      );
+    });
+
+    it('should fall back to process.cwd() when no config base path is available', () => {
+      expect(resolveAgenticWorkingDir('./workspace')).toBe(
+        path.resolve(process.cwd(), 'workspace'),
+      );
+    });
+
+    it('should preserve absolute paths and URLs', () => {
+      expect(resolveAgenticWorkingDir('/var/tmp/workspace', '/test/basePath')).toBe(
+        '/var/tmp/workspace',
+      );
+      expect(resolveAgenticWorkingDir('file:///var/tmp/workspace', '/test/basePath')).toBe(
+        'file:///var/tmp/workspace',
+      );
     });
   });
 });

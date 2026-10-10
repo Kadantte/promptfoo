@@ -1,14 +1,33 @@
 import { fetchWithCache } from '../../cache';
-import { getEnvString } from '../../envars';
 import logger from '../../logger';
+import { fetchWithProxy } from '../../util/fetch/index';
 import {
   maybeLoadResponseFormatFromExternalFile,
   maybeLoadToolsFromExternalFile,
+  renderVarsInObject,
 } from '../../util/index';
+import { resolveProviderApiKey } from '../credentials';
+import { resolveProviderEnv } from '../env';
 import { FunctionCallbackHandler } from '../functionCallbackUtils';
+import { getOpenAiEffectiveServiceTier } from '../openai/util';
 import { ResponsesProcessor } from '../responses/index';
+import { normalizeResponsesInput } from '../responses/input';
+import { readResponsesStream } from '../responses/stream';
 import { getRequestTimeoutMs } from '../shared';
-import { calculateXAICost, GROK_4_MODELS } from './chat';
+import {
+  assertXAIServiceTier,
+  calculateXAICost,
+  GROK_4_MODELS,
+  getXAICostInUsd,
+  getXAIRequestModel,
+  getXAIRequestOption,
+  hasXAICostOverrides,
+  resolveGrok47ReasoningEffort,
+  validateXAIReasoningEffort,
+  type XAICostConfig,
+  XAIRequestConfigError,
+  type XAIServiceTier,
+} from './chat';
 
 import type { EnvOverrides } from '../../types/env';
 import type {
@@ -53,7 +72,7 @@ export interface XAIXSearchTool {
 }
 
 export interface XAICodeInterpreterTool {
-  type: 'code_interpreter';
+  type: 'code_execution' | 'code_interpreter';
   /** Container configuration */
   container?: {
     /** Pre-installed pip packages */
@@ -62,17 +81,25 @@ export interface XAICodeInterpreterTool {
 }
 
 export interface XAICollectionsSearchTool {
-  type: 'collections_search';
-  /** Collection IDs to search */
+  type: 'collections_search' | 'file_search';
+  /** Collection IDs to search when using `collections_search`. */
   collection_ids?: string[];
+  /** Collection IDs to search when using OpenAI-compatible `file_search`. */
+  vector_store_ids?: string[];
+  /** Maximum results for OpenAI-compatible `file_search`. */
+  max_num_results?: number;
 }
 
 export interface XAIMCPTool {
   type: 'mcp';
   /** MCP server URL */
   server_url: string;
-  /** Optional server label */
+  /** Optional label used for tool-call prefixing */
   server_label?: string;
+  /** Optional description of the server capabilities */
+  server_description?: string;
+  /** Optional bearer token for MCP server requests */
+  authorization?: string;
   /** Headers for MCP requests */
   headers?: Record<string, string>;
   /** Allowed tools from this server */
@@ -86,12 +113,37 @@ export type XAIAgentTool =
   | XAICollectionsSearchTool
   | XAIMCPTool;
 
-export interface XAIResponsesConfig {
+function buildTextFormat(responseFormat: any) {
+  if (!responseFormat) {
+    return { format: { type: 'text' } };
+  }
+
+  if (responseFormat.type === 'json_object') {
+    return { format: { type: 'json_object' } };
+  }
+
+  if (responseFormat.type === 'json_schema') {
+    const schema = responseFormat.schema || responseFormat.json_schema?.schema;
+    const schemaName = responseFormat.json_schema?.name || responseFormat.name || 'response_schema';
+    return {
+      format: {
+        type: 'json_schema',
+        name: schemaName,
+        schema,
+        strict: true,
+      },
+    };
+  }
+
+  return { format: { type: 'text' } };
+}
+
+export interface XAIResponsesConfig extends XAICostConfig {
   /** API key (defaults to XAI_API_KEY env var) */
   apiKey?: string;
   /** API base URL (defaults to https://api.x.ai/v1) */
   apiBaseUrl?: string;
-  /** Region for regional endpoints (e.g., 'us-west-1') */
+  /** Region for regional endpoints (e.g., 'eu-west-1') */
   region?: string;
   /** Temperature (0-2) */
   temperature?: number;
@@ -99,6 +151,8 @@ export interface XAIResponsesConfig {
   top_p?: number;
   /** Maximum output tokens */
   max_output_tokens?: number;
+  /** Maximum number of tool calls allowed for the request */
+  max_tool_calls?: number;
   /** System instructions */
   instructions?: string;
   /** Response format (json_object, json_schema, or text) */
@@ -109,8 +163,18 @@ export interface XAIResponsesConfig {
   tool_choice?: 'auto' | 'required' | 'none' | { type: 'function'; function: { name: string } };
   /** Enable parallel tool calls */
   parallel_tool_calls?: boolean;
+  /** Stream partial response deltas from the API */
+  stream?: boolean;
   /** Store response for later retrieval */
   store?: boolean;
+  /** Processing tier. Omitted and 'default' use standard processing; 'priority' requests priority processing. */
+  service_tier?: XAIServiceTier;
+  /** Additional response data to include, such as encrypted reasoning content */
+  include?: string[];
+  /** Reasoning configuration for Grok 4.7, Grok 4.6, Grok 4.5, Grok 4.3, or multi-agent models */
+  reasoning?: {
+    effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh';
+  };
   /** Previous response ID for multi-turn conversations */
   previous_response_id?: string;
   /** User identifier */
@@ -125,6 +189,17 @@ export interface XAIResponsesConfig {
   passthrough?: Record<string, any>;
 }
 
+function resolveGrok47Reasoning(reasoning: unknown, vars?: Record<string, unknown>): unknown {
+  if (typeof reasoning !== 'object' || Array.isArray(reasoning)) {
+    throw new XAIRequestConfigError('xAI Grok 4.7 reasoning must be an object');
+  }
+  if (!Object.prototype.hasOwnProperty.call(reasoning, 'effort')) {
+    return reasoning;
+  }
+  const config = reasoning as Record<string, unknown>;
+  return { ...config, effort: resolveGrok47ReasoningEffort(config.effort, vars) };
+}
+
 /**
  * xAI Responses API Provider
  *
@@ -133,9 +208,10 @@ export interface XAIResponsesConfig {
  * and interact with MCP servers.
  *
  * Usage:
- *   xai:responses:grok-4-1-fast-reasoning
- *   xai:responses:grok-4-fast
- *   xai:responses:grok-4
+ *   xai:responses:grok-4.7
+ *   xai:responses:grok-4.5
+ *   xai:responses:grok-4.3
+ *   xai:responses:grok-4.20-0309-reasoning
  */
 export class XAIResponsesProvider implements ApiProvider {
   modelName: string;
@@ -157,14 +233,33 @@ export class XAIResponsesProvider implements ApiProvider {
       modelName: this.modelName,
       providerType: 'xai',
       functionCallbackHandler: this.functionCallbackHandler,
-      costCalculator: (modelName: string, usage: any, config?: any) =>
-        calculateXAICost(
-          modelName,
-          config || {},
-          usage?.input_tokens || usage?.prompt_tokens,
-          usage?.output_tokens || usage?.completion_tokens,
-        ) ?? 0,
+      costCalculator: (_modelName, usage, config, responseData) =>
+        this.calculateCost(usage, config, responseData),
     });
+  }
+
+  private calculateCost(
+    usage: any,
+    config: XAIResponsesConfig = {},
+    responseData?: { service_tier?: string },
+  ): number | undefined {
+    const reportedCost = hasXAICostOverrides(config) ? undefined : getXAICostInUsd(usage);
+    return (
+      reportedCost ??
+      calculateXAICost(
+        getXAIRequestModel(this.modelName, config),
+        config,
+        usage?.input_tokens ?? usage?.prompt_tokens,
+        usage?.output_tokens ?? usage?.completion_tokens,
+        usage?.output_tokens_details?.reasoning_tokens ??
+          usage?.completion_tokens_details?.reasoning_tokens,
+        usage?.input_tokens_details?.cached_tokens ?? usage?.prompt_tokens_details?.cached_tokens,
+        {
+          apiUrl: this.getApiUrl(),
+          serviceTier: responseData?.service_tier === 'priority' ? 'priority' : undefined,
+        },
+      )
+    );
   }
 
   id(): string {
@@ -187,12 +282,16 @@ export class XAIResponsesProvider implements ApiProvider {
   }
 
   protected getApiKey(): string | undefined {
-    return this.config.apiKey || getEnvString('XAI_API_KEY');
+    return resolveProviderApiKey(this.config, this.env, ['XAI_API_KEY']);
   }
 
   protected getApiUrl(): string {
     if (this.config.apiBaseUrl) {
       return this.config.apiBaseUrl;
+    }
+    const envApiBaseUrl = resolveProviderEnv(this.env, ['XAI_API_BASE_URL'])?.value;
+    if (envApiBaseUrl) {
+      return envApiBaseUrl;
     }
     if (this.config.region) {
       return `https://${this.config.region}.api.x.ai/v1`;
@@ -205,17 +304,23 @@ export class XAIResponsesProvider implements ApiProvider {
     context?: CallApiContextParams,
     _callApiOptions?: CallApiOptionsParams,
   ) {
+    const promptConfig = context?.prompt?.config;
     const config = {
       ...this.config,
-      ...context?.prompt?.config,
+      ...promptConfig,
     };
+    const effectiveServiceTier = getOpenAiEffectiveServiceTier(this.config, promptConfig);
+    const model = getXAIRequestModel(this.modelName, config);
+    const usesGrok47 = model === 'grok-4.7';
 
-    // Parse input - can be string or array of messages
+    // Parse input - can be string or array of messages. Chat-format content parts are
+    // translated to their Responses equivalents so multimodal prompts authored for the chat
+    // API work here too (the Responses API rejects `type: "text"` / `"image_url"` outright).
     let input;
     try {
       const parsedJson = JSON.parse(prompt);
       if (Array.isArray(parsedJson)) {
-        input = parsedJson;
+        input = normalizeResponsesInput(parsedJson);
       } else {
         input = prompt;
       }
@@ -235,30 +340,7 @@ export class XAIResponsesProvider implements ApiProvider {
       context?.vars,
     );
 
-    // Build text format configuration
-    let textFormat;
-    if (responseFormat) {
-      if (responseFormat.type === 'json_object') {
-        textFormat = { format: { type: 'json_object' } };
-      } else if (responseFormat.type === 'json_schema') {
-        // Schema is already loaded by maybeLoadResponseFormatFromExternalFile
-        const schema = responseFormat.schema || responseFormat.json_schema?.schema;
-        const schemaName =
-          responseFormat.json_schema?.name || responseFormat.name || 'response_schema';
-        textFormat = {
-          format: {
-            type: 'json_schema',
-            name: schemaName,
-            schema,
-            strict: true,
-          },
-        };
-      } else {
-        textFormat = { format: { type: 'text' } };
-      }
-    } else {
-      textFormat = { format: { type: 'text' } };
-    }
+    const textFormat = buildTextFormat(responseFormat);
 
     // Load tools from external file if needed
     const loadedTools = config.tools
@@ -275,27 +357,54 @@ export class XAIResponsesProvider implements ApiProvider {
       ...(config.top_p === undefined ? {} : { top_p: config.top_p }),
       ...(loadedTools && loadedTools.length > 0 ? { tools: loadedTools } : {}),
       ...(config.tool_choice ? { tool_choice: config.tool_choice } : {}),
+      ...(config.max_tool_calls ? { max_tool_calls: config.max_tool_calls } : {}),
       ...(config.previous_response_id ? { previous_response_id: config.previous_response_id } : {}),
       text: textFormat,
+      ...(config.include?.length ? { include: config.include } : {}),
+      ...(config.reasoning ? { reasoning: config.reasoning } : {}),
       ...('parallel_tool_calls' in config
         ? { parallel_tool_calls: Boolean(config.parallel_tool_calls) }
         : {}),
+      ...(config.stream ? { stream: config.stream } : {}),
       ...('store' in config ? { store: Boolean(config.store) } : {}),
       ...(config.user ? { user: config.user } : {}),
+      ...(config.service_tier === undefined ? {} : { service_tier: config.service_tier }),
       ...(config.passthrough || {}),
+      ...(effectiveServiceTier === undefined ? {} : { service_tier: effectiveServiceTier }),
     };
 
-    // Filter unsupported parameters for Grok-4 models
-    if (GROK_4_MODELS.includes(this.modelName)) {
+    assertXAIServiceTier(body.service_tier);
+
+    if (usesGrok47) {
+      const reasoning = getXAIRequestOption(
+        'reasoning',
+        context?.test?.options,
+        context?.prompt?.config,
+        this.config,
+      );
+      if (reasoning == null) {
+        delete body.reasoning;
+      } else {
+        body.reasoning = resolveGrok47Reasoning(reasoning, context?.vars);
+      }
+    } else if (body.reasoning !== undefined) {
+      body.reasoning = renderVarsInObject(body.reasoning, context?.vars);
+    }
+
+    // Filter unsupported parameters for Grok 4-family models
+    if (GROK_4_MODELS.includes(model)) {
       delete body.presence_penalty;
       delete body.frequency_penalty;
       delete body.stop;
     }
 
+    validateXAIReasoningEffort(model, body.reasoning?.effort, 'reasoning.effort');
+
     return {
       body,
       config: {
         ...config,
+        service_tier: effectiveServiceTier,
         tools: loadedTools,
         response_format: responseFormat,
       },
@@ -315,7 +424,18 @@ export class XAIResponsesProvider implements ApiProvider {
       };
     }
 
-    const { body, config } = await this.getRequestBody(prompt, context, callApiOptions);
+    const request = await this.getRequestBody(prompt, context, callApiOptions).catch(
+      (error: unknown) => {
+        if (error instanceof XAIRequestConfigError) {
+          return { error: `xAI request error: ${error.message}` };
+        }
+        throw error;
+      },
+    );
+    if ('error' in request) {
+      return request;
+    }
+    const { body, config } = request;
 
     logger.debug(`[xAI Responses] Calling ${this.getApiUrl()}/responses`, {
       model: this.modelName,
@@ -329,43 +449,70 @@ export class XAIResponsesProvider implements ApiProvider {
     let statusText: string;
 
     try {
-      const response = await fetchWithCache(
-        `${this.getApiUrl()}/responses`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-            ...config.headers,
-          },
-          body: JSON.stringify(body),
-        },
-        getRequestTimeoutMs(),
-        'json',
-        context?.bustCache ?? context?.debug,
-        this.config.maxRetries,
-      );
+      if (body.stream) {
+        const timeoutMs = getRequestTimeoutMs();
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetchWithProxy(`${this.getApiUrl()}/responses`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${apiKey}`,
+              ...config.headers,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
 
-      data = response.data;
-      cached = response.cached;
-      status = response.status;
-      statusText = response.statusText;
+          status = response.status;
+          statusText = response.statusText;
+          // Streaming bypasses fetchWithCache, so cache-hit telemetry is always false.
+          cached = false;
+          if (status < 200 || status >= 300) {
+            const text = await response.text();
+            try {
+              data = JSON.parse(text);
+            } catch {
+              data = text;
+            }
+          } else {
+            data = await readResponsesStream(response, 'xAI', logger);
+          }
+        } catch (err) {
+          if (err instanceof Error && err.name === 'AbortError') {
+            throw new Error(`xAI streaming response timed out after ${timeoutMs}ms`);
+          }
+          throw err;
+        } finally {
+          clearTimeout(timeoutHandle);
+        }
+      } else {
+        const response = await fetchWithCache(
+          `${this.getApiUrl()}/responses`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${apiKey}`,
+              ...config.headers,
+            },
+            body: JSON.stringify(body),
+          },
+          getRequestTimeoutMs(),
+          'json',
+          context?.bustCache ?? context?.debug,
+          this.config.maxRetries,
+        );
+
+        data = response.data;
+        cached = response.cached;
+        status = response.status;
+        statusText = response.statusText;
+      }
 
       if (status < 200 || status >= 300) {
-        const errorMessage = `xAI API error: ${status} ${statusText}\n${
-          typeof data === 'string' ? data : JSON.stringify(data)
-        }`;
-
-        // Check for specific error types
-        if (data?.error?.code === 'invalid_prompt') {
-          return {
-            output: errorMessage,
-            tokenUsage: this.getTokenUsage(data, cached),
-            isRefusal: true,
-          };
-        }
-
-        return { error: errorMessage };
+        return this.handleUnsuccessfulResponse(data, status, statusText, cached, config);
       }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -389,7 +536,35 @@ export class XAIResponsesProvider implements ApiProvider {
     }
 
     // Use shared processor for consistent response handling
-    return this.processor.processResponseOutput(data, config, cached);
+    const result = await this.processor.processResponseOutput(data, config, cached, {
+      suppressReasoningOutput: Boolean(body.stream),
+    });
+    if (cached) {
+      result.cost = 0;
+    }
+    return result;
+  }
+
+  private handleUnsuccessfulResponse(
+    data: any,
+    status: number,
+    statusText: string,
+    cached: boolean,
+    config: XAIResponsesConfig,
+  ): ProviderResponse {
+    const errorMessage = `xAI API error: ${status} ${statusText}\n${
+      typeof data === 'string' ? data : JSON.stringify(data)
+    }`;
+    if (data?.error?.code === 'invalid_prompt') {
+      return {
+        output: errorMessage,
+        tokenUsage: this.getTokenUsage(data, cached),
+        cached,
+        cost: cached ? 0 : this.calculateCost(data.usage, config, data),
+        isRefusal: true,
+      };
+    }
+    return { error: errorMessage };
   }
 
   private getTokenUsage(data: any, cached: boolean): Partial<TokenUsage> {

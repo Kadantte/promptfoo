@@ -45,7 +45,7 @@ When the **first step** is an agentic strategy (hydra, crescendo, goat, jailbrea
 
 ```yaml title="promptfooconfig.yaml"
 providers:
-  - id: openai:chat:gpt-4o-audio-preview
+  - id: openai:chat:gpt-audio-1.5
     config:
       modalities: ['text', 'audio']
       audio:
@@ -278,9 +278,9 @@ redteam:
           - base64 # Finally base64 encode
 ```
 
-### Injection Chain
+### Jailbreak Template Chain
 
-Combine prompt injection with encoding:
+Combine jailbreak templates with encoding:
 
 ```yaml title="promptfooconfig.yaml"
 redteam:
@@ -288,8 +288,8 @@ redteam:
     - id: layer
       config:
         steps:
-          - prompt-injection # Add injection payloads
-          - rot13 # Obfuscate the injection
+          - jailbreak-templates # Apply static jailbreak templates
+          - rot13 # Obfuscate the payload
 ```
 
 ### Custom Strategy Pipeline
@@ -366,7 +366,7 @@ class AudioProvider {
       }
     }
 
-    // Call your audio-capable API (e.g., OpenAI gpt-4o-audio-preview)
+    // Call your audio-capable API (e.g., OpenAI gpt-audio-1.5)
     const response = await yourApiCall(messages);
 
     return {
@@ -455,7 +455,7 @@ The following strategies can be used as the first step with per-turn transforms:
 
 - [Audio Strategy](./audio.md) - Text-to-speech conversion
 - [Image Strategy](./image.md) - Text-to-image conversion
-- [Hydra Strategy](./multi-turn.md) - Multi-turn jailbreak attacks
+- [Hydra Strategy](./hydra.md) - Multi-turn jailbreak attacks
 - [ROT13](./rot13.md) - Simple cipher encoding
 - [Base64](./base64.md) - Common encoding technique
 - [Custom Strategy Scripts](./custom.md) - Create your own strategies

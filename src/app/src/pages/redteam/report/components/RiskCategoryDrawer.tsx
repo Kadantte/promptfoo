@@ -10,10 +10,10 @@ import {
 import { Sheet, SheetContent, SheetTitle } from '@app/components/ui/sheet';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@app/components/ui/tabs';
 import { cn } from '@app/lib/utils';
-import { getActualPrompt } from '@app/utils/providerResponse';
 import { categoryAliases, displayNameOverrides } from '@promptfoo/redteam/constants';
+import { getActualPrompt } from '@promptfoo/util/providerResponse';
 import { ChevronDown, Lightbulb } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import ChatMessages, { type Message } from '../../../eval/components/ChatMessages';
 import EvalOutputPromptDialog from '../../../eval/components/EvalOutputPromptDialog';
 import PluginStrategyFlow from './PluginStrategyFlow';
@@ -173,7 +173,7 @@ const RiskCategoryDrawer = ({
       <Sheet open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
         <SheetContent
           side="right"
-          className="w-[500px] overflow-y-auto sm:max-w-[500px]"
+          className="w-full overflow-y-auto sm:w-[500px] sm:max-w-[500px]"
           aria-describedby={undefined}
         >
           <SheetTitle className="sr-only">{displayName}</SheetTitle>
@@ -289,7 +289,7 @@ const RiskCategoryDrawer = ({
     <Sheet open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <SheetContent
         side="right"
-        className="w-[750px] overflow-y-auto sm:max-w-[750px]"
+        className="w-full overflow-y-auto sm:w-[750px] sm:max-w-[750px]"
         aria-describedby={undefined}
       >
         <SheetTitle className="sr-only">{displayName}</SheetTitle>
@@ -352,7 +352,7 @@ const RiskCategoryDrawer = ({
             }
             className="mt-4"
           >
-            <TabsList className="w-full">
+            <TabsList className="grid !h-auto w-full grid-cols-1 gap-1 sm:grid-cols-3 sm:!h-10 sm:gap-0">
               <TabsTrigger value="flagged" className="flex-1">
                 Failed Tests ({failures.length})
               </TabsTrigger>

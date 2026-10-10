@@ -1,6 +1,8 @@
 import { getDefaultPort } from '../constants';
 import logger from '../logger';
+import { formatLibsqlBindingErrorMessage } from '../util/libsqlBindingErrors';
 import { BrowserBehavior, checkServerRunning } from '../util/server';
+import { ServerError } from './errors';
 import { startServer } from './server';
 
 async function main() {
@@ -15,6 +17,11 @@ async function main() {
 }
 
 main().catch((err) => {
-  logger.error(`Failed to start server: ${String(err)}`);
+  const libsqlBindingErrorMessage = formatLibsqlBindingErrorMessage(err);
+  if (libsqlBindingErrorMessage) {
+    console.error(libsqlBindingErrorMessage);
+  } else if (!(err instanceof ServerError)) {
+    logger.error(`Failed to start server: ${String(err)}`);
+  }
   process.exitCode = 1;
 });

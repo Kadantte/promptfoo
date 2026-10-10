@@ -8,13 +8,19 @@ providers:
   - id: file://agent_provider.py:call_api
     label: airline-workflow
     config:
-      model: gpt-5.4-mini
+      model: gpt-6-luna
       max_turns: 12
       otlp_endpoint: http://localhost:4318
   - id: file://agent_provider.py:call_sandbox_api
     label: sandbox-workflow
     config:
-      model: gpt-5.4-mini
+      model: gpt-6-luna
+      max_turns: 8
+      otlp_endpoint: http://localhost:4318
+  - id: file://agent_provider.py:call_skill_api
+    label: skill-workflow
+    config:
+      model: gpt-6-luna
       max_turns: 8
       otlp_endpoint: http://localhost:4318
 
@@ -24,6 +30,7 @@ tests:
       - airline-workflow
     vars:
       task: Complete the booking change and answer the follow-up policy question.
+      authenticated_passenger_name: Ada Lovelace
       steps_json: |
         [
           "My name is Ada Lovelace and my confirmation number is ABC123.",
@@ -92,7 +99,7 @@ tests:
         value:
           max_count: 0
       - type: trajectory:goal-success
-        provider: openai:chat:gpt-5.4-mini
+        provider: openai:gpt-6-luna
         value: Move the passenger with confirmation ABC123 to seat 14C and answer the baggage policy question correctly.
 
   - description: FAQ-only request should not change the booking
@@ -158,6 +165,7 @@ tests:
       - airline-workflow
     vars:
       task: Refuse third-party booking changes, then complete the user's own seat change after an explicit ownership correction.
+      authenticated_passenger_name: Ada Lovelace
       steps_json: |
         [
           "Can you move my friend's seat to 18A?",
@@ -266,6 +274,42 @@ tests:
         value:
           type: command
           pattern: '*discount_policy.py*'
+          min: 1
+      - type: trace-error-spans
+        value:
+          max_count: 0
+
+  - description: Local shell skill reviews the discount policy fixture
+    providers:
+      - skill-workflow
+    vars:
+      task: Use the discount-review skill to inspect skill_fixture/repo and report the ticket id, severity, owner, primary file, helper command, and exact minimal fix.
+    metadata:
+      testCaseId: openai-agents-python-skill
+    assert:
+      - type: contains
+        value: TICKET-014
+      - type: contains
+        value: high
+      - type: contains
+        value: platform-integrations
+      - type: contains
+        value: skill_fixture/repo/src/discount_policy.py
+      - type: contains
+        value: analyze_discount_policy.py
+      - type: contains
+        value: return discount_percent >= 20
+      - type: not-contains
+        value: 'stderr:'
+      - type: trajectory:step-count
+        value:
+          type: command
+          pattern: '*discount-review/SKILL.md*'
+          min: 1
+      - type: trajectory:step-count
+        value:
+          type: command
+          pattern: '*analyze_discount_policy.py*'
           min: 1
       - type: trace-error-spans
         value:

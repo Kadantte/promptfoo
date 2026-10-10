@@ -41,7 +41,7 @@ npx promptfoo@latest redteam run
 
 ## Prerequisites
 
-- Node.js 20+ installed in your CI environment
+- Node.js `>=22.22.0` installed in your CI environment (Node.js 24 LTS recommended)
 - LLM provider API keys (stored as secure environment variables)
 - A promptfoo configuration file (`promptfooconfig.yaml`)
 - (Optional) Docker for containerized environments
@@ -66,6 +66,20 @@ npx promptfoo@latest redteam run
 
 See our [red team quickstart](/docs/red-team/quickstart) for security testing details.
 
+#### Attach CI/CD Context with Tags
+
+Use repeatable `--tag key=value` flags to attach pipeline context to an evaluation
+without modifying `promptfooconfig.yaml` or a red team scan template. Tags are saved
+with the eval and included when results are shared.
+
+```bash
+npx promptfoo@latest eval --tag ci.run-id="$CI_PIPELINE_ID" --tag git.sha="$CI_COMMIT_SHA"
+npx promptfoo@latest redteam run --tag ci.run-id="$CI_PIPELINE_ID" --tag git.sha="$CI_COMMIT_SHA"
+```
+
+`promptfoo redteam eval` accepts the same `--tag` option when running previously
+generated probes from `redteam.yaml`.
+
 ### 2. Output Formats
 
 Promptfoo supports multiple output formats for different CI/CD needs:
@@ -77,11 +91,11 @@ npx promptfoo@latest eval -o results.json
 # HTML for human-readable reports
 npx promptfoo@latest eval -o report.html
 
-# XML for enterprise tools
-npx promptfoo@latest eval -o results.xml
+# JUnit XML for native CI test-report viewers
+npx promptfoo@latest eval -o results.junit.xml
 
 # Multiple formats
-npx promptfoo@latest eval -o results.json -o report.html
+npx promptfoo@latest eval -o results.json -o report.html -o results.junit.xml
 ```
 
 Learn more about [output formats and processing](/docs/configuration/outputs).
@@ -131,7 +145,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
 
       - name: Cache promptfoo
@@ -187,6 +201,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '24'
+
       - name: Run red team scan
         uses: promptfoo/promptfoo-action@v1
         with:
@@ -203,7 +222,7 @@ See also: [Standalone GitHub Action example](https://github.com/promptfoo/prompt
 See our [detailed GitLab CI guide](/docs/integrations/gitlab-ci).
 
 ```yaml title=".gitlab-ci.yml"
-image: node:20
+image: node:24
 
 evaluate:
   script:
@@ -211,7 +230,9 @@ evaluate:
       npx promptfoo@latest eval \
         -c promptfooconfig.yaml \
         --share \
-        -o output.json
+        -o output.json \
+        -o report.html \
+        -o output.junit.xml
   variables:
     OPENAI_API_KEY: ${OPENAI_API_KEY}
     PROMPTFOO_CACHE_PATH: .cache/promptfoo
@@ -221,7 +242,7 @@ evaluate:
       - .cache/promptfoo
   artifacts:
     reports:
-      junit: output.xml
+      junit: output.junit.xml
     paths:
       - output.json
       - report.html
@@ -284,7 +305,7 @@ pipeline {
 Create a custom Docker image with promptfoo pre-installed:
 
 ```dockerfile title="Dockerfile"
-FROM node:20-slim
+FROM node:24-slim
 WORKDIR /app
 COPY . .
 CMD ["npx", "promptfoo@latest", "eval"]
@@ -292,19 +313,25 @@ CMD ["npx", "promptfoo@latest", "eval"]
 
 ### 2. Parallel Testing
 
-Test multiple models or configurations in parallel:
+Test multiple models in parallel by overriding the provider ID. Configure credentials for each provider in your workflow:
 
 ```yaml
 # GitHub Actions example
 strategy:
   matrix:
-    model: [gpt-4, gpt-3.5-turbo, claude-3-opus]
+    include:
+      - name: gpt-6-sol
+        provider: openai:gpt-6-sol
+      - name: claude-opus-5-5
+        provider: anthropic:messages:claude-opus-5-5
+      - name: gemini-3.1-pro-preview
+        provider: google:gemini-3.1-pro-preview
 steps:
-  - name: Test ${{ matrix.model }}
+  - name: Test ${{ matrix.name }}
     run: |
       npx promptfoo@latest eval \
-        --providers.0.config.model=${{ matrix.model }} \
-        -o results-${{ matrix.model }}.json
+        --providers "${{ matrix.provider }}" \
+        -o "results-${{ matrix.name }}.json"
 ```
 
 ### 3. Scheduled Security Scans
@@ -325,7 +352,7 @@ jobs:
         run: |
           npx promptfoo@latest redteam generate \
             --plugins harmful,pii,contracts \
-            --strategies jailbreak,prompt-injection
+            --strategies jailbreak,jailbreak-templates
           npx promptfoo@latest redteam run
 ```
 
@@ -370,43 +397,53 @@ The output JSON follows this schema:
 
 ```typescript
 interface OutputFile {
-  evalId?: string;
+  evalId: string | null;
   results: {
+    version: 3;
+    timestamp: string;
     stats: {
       successes: number;
       failures: number;
       errors: number;
     };
-    outputs: Array<{
-      pass: boolean;
+    prompts: Array<unknown>;
+    results: Array<{
+      success: boolean;
       score: number;
       error?: string;
       // ... other fields
     }>;
   };
-  config: UnifiedConfig;
+  config: Partial<UnifiedConfig>;
   shareableUrl: string | null;
+  metadata?: OutputMetadata;
+  vars?: string[];
+  runtimeOptions?: Partial<EvaluateOptions>;
+  traces?: TraceData[];
+  blobAssets?: ExportedBlobAsset[];
 }
 ```
+
+`promptfoo eval -o results.json` and `promptfoo export eval <evalId>` use the
+same eval output envelope. Portable exports created with
+`promptfoo export eval <evalId> --include-media` may add embedded `blobAssets`.
 
 Example processing script:
 
 ```javascript title="process-results.js"
 const fs = require('fs');
-const results = JSON.parse(fs.readFileSync('results.json', 'utf8'));
+const evalOutput = JSON.parse(fs.readFileSync('results.json', 'utf8'));
+const { stats, results: evalResults } = evalOutput.results;
 
 // Calculate metrics
-const passRate =
-  (results.results.stats.successes /
-    (results.results.stats.successes + results.results.stats.failures)) *
-  100;
+const passRate = (stats.successes / (stats.successes + stats.failures)) * 100;
 
 console.log(`Pass rate: ${passRate.toFixed(2)}%`);
-console.log(`Shareable URL: ${results.shareableUrl}`);
+console.log(`Shareable URL: ${evalOutput.shareableUrl}`);
 
 // Check for specific failures
-const criticalFailures = results.results.outputs.filter(
-  (o) => o.error?.includes('security') || o.error?.includes('injection'),
+const criticalFailures = evalResults.filter(
+  (result) => result.error?.includes('security') || result.error?.includes('injection'),
 );
 
 if (criticalFailures.length > 0) {
@@ -434,7 +471,8 @@ gh pr comment --body "
 
 ## Caching Strategies
 
-Optimize CI/CD performance with proper caching [[memory:3455374]]:
+<!-- prettier-ignore -->
+Optimize CI/CD performance with proper caching:
 
 ```yaml
 # Set cache location

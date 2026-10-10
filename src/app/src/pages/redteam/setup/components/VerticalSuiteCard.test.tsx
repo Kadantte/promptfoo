@@ -4,7 +4,7 @@ import { TooltipProvider } from '@app/components/ui/tooltip';
 import { ToastProvider } from '@app/contexts/ToastContext';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TestCaseGenerationProvider } from './TestCaseGenerationProvider';
 import VerticalSuiteCard from './VerticalSuiteCard';
@@ -299,6 +299,28 @@ describe('VerticalSuiteCard handleToggleAll batch update', () => {
       // The component should remain in its current state
       // (propagation was stopped)
       expect(screen.getByRole('heading', { name: 'Test Suite' })).toBeInTheDocument();
+    });
+  });
+
+  describe('plugin action labels', () => {
+    it('labels configure and documentation actions for selected plugins', async () => {
+      const user = userEvent.setup();
+      const selectedPlugins = new Set<Plugin>(['bola']);
+
+      renderWithProviders(
+        <VerticalSuiteCard {...defaultProps} selectedPlugins={selectedPlugins} />,
+      );
+
+      await user.click(screen.getByRole('button', { name: 'Expand' }));
+
+      expect(
+        screen.getByRole('button', { name: 'Configure Object-Level Authorization Bypass' }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole('button', {
+          name: 'View documentation for Object-Level Authorization Bypass',
+        }),
+      ).toBeInTheDocument();
     });
   });
 });

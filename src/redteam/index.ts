@@ -4,13 +4,14 @@ import async from 'async';
 import chalk from 'chalk';
 import cliProgress from 'cli-progress';
 import Table from 'cli-table3';
-import yaml from 'js-yaml';
 import cliState from '../cliState';
 import { getEnvString } from '../envars';
 import logger, { getLogLevel } from '../logger';
 import { checkRemoteHealth } from '../util/apiHealth';
+import { maybeLoadFromExternalFile } from '../util/file';
 import invariant from '../util/invariant';
 import { extractVariablesFromTemplates } from '../util/templates';
+import { loadYaml } from '../util/yamlLoad';
 import {
   ALIASED_PLUGIN_MAPPINGS,
   BIAS_PLUGINS,
@@ -36,11 +37,16 @@ import {
 import { CODING_AGENT_CORE_PLUGINS, CODING_AGENT_PLUGINS } from './constants/codingAgents';
 import { extractEntities } from './extraction/entities';
 import { extractSystemPurpose } from './extraction/purpose';
+import { trackGenerationTokenUsage } from './generationTokenUsage';
 import { CustomPlugin } from './plugins/custom';
 import { Plugins } from './plugins/index';
 import { isValidPolicyObject, makeInlinePolicyIdSync } from './plugins/policy/utils';
 import { redteamProviderManager } from './providers/shared';
 import { getRemoteHealthUrl, shouldGenerateRemote } from './remoteGeneration';
+import {
+  remoteGenerationContextPayload,
+  resolveRedteamGenerationContext,
+} from './remoteGenerationContext';
 import {
   getGeneratedPromptOverLimit,
   getMaxCharsPerMessageModifierValue,
@@ -55,11 +61,12 @@ import {
   getShortPluginId,
 } from './util';
 
-import type { ApiProvider, TestCase, TestCaseWithPlugin } from '../types/index';
-import type { Inputs } from '../types/shared';
+import type { ApiProvider, Inputs, TestCase, TestCaseWithPlugin, TokenUsage } from '../types/index';
+import type { RedteamProviderSelection } from './providers/shared';
 import type {
   FailedPluginInfo,
   Policy,
+  RedteamGenerationContext,
   RedteamPluginObject,
   RedteamStrategyObject,
   SynthesizeOptions,
@@ -335,7 +342,7 @@ export function resolvePluginConfig(config: Record<string, any> | undefined): Re
       }
 
       if (filePath.endsWith('.yaml')) {
-        config[key] = yaml.load(fs.readFileSync(filePath, 'utf8'));
+        config[key] = loadYaml(fs.readFileSync(filePath, 'utf8'));
       } else if (filePath.endsWith('.json')) {
         config[key] = JSON.parse(fs.readFileSync(filePath, 'utf8'));
       } else {
@@ -403,6 +410,62 @@ const formatTestCount = (numTests: number, strategy: boolean): string =>
   numTests === 1
     ? `1 ${strategy ? 'additional ' : ''}test`
     : `${numTests} ${strategy ? 'additional ' : ''}tests`;
+
+function getPluginLanguageCount(
+  plugin: SynthesizeOptions['plugins'][number],
+  language?: string | string[],
+): number {
+  const pluginLanguageConfig = plugin.config?.language ?? language;
+  return Array.isArray(pluginLanguageConfig) ? pluginLanguageConfig.length : 1;
+}
+
+// Cache resolved intent counts per plugin instance. Resolving `file://`
+// intent lists requires disk I/O + parsing; `getExpectedPluginTestCount` is
+// invoked many times per run (totals, logging, progress, reporting), so we
+// memoize on the plugin object identity to avoid redundant reads.
+const intentTestCountCache = new WeakMap<object, number>();
+
+function getIntentTestCount(plugin: SynthesizeOptions['plugins'][number]): number | undefined {
+  if (plugin.id !== 'intent') {
+    return undefined;
+  }
+
+  const cached = intentTestCountCache.get(plugin as object);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const intent = plugin.config?.intent;
+  if (!intent) {
+    intentTestCountCache.set(plugin as object, 0);
+    return 0;
+  }
+
+  // Resolve `file://` references so pre-generation totals match what IntentPlugin
+  // will actually emit at runtime. Falls back to the literal value if the file
+  // can't be read yet (e.g. the path is unresolved or doesn't exist locally).
+  let resolved: unknown;
+  try {
+    resolved = maybeLoadFromExternalFile(intent as string | object);
+  } catch (err) {
+    logger.debug(
+      `[redteam] Failed to resolve intent file for pre-generation count; treating as a single intent. Run-time count from IntentPlugin will be authoritative. Error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    resolved = intent;
+  }
+
+  const count = Array.isArray(resolved) ? resolved.length : 1;
+  intentTestCountCache.set(plugin as object, count);
+  return count;
+}
+
+function getExpectedPluginTestCount(
+  plugin: SynthesizeOptions['plugins'][number],
+  language?: string | string[],
+): number {
+  const languageCount = getPluginLanguageCount(plugin, language);
+  return (getIntentTestCount(plugin) ?? plugin.numTests ?? 0) * languageCount;
+}
 
 /**
  * Gets the language from a test case's metadata.
@@ -532,10 +595,12 @@ async function applyStrategies(
   testCases: TestCaseWithPlugin[],
   strategies: RedteamStrategyObject[],
   injectVar: string,
-  provider: ApiProvider,
+  providerSelection: RedteamProviderSelection,
   purpose: string,
   excludeTargetOutputFromAgenticAttackGeneration?: boolean,
   maxCharsPerMessage?: number,
+  redteamGenerationContext?: RedteamGenerationContext,
+  wrapGenerationProvider?: (provider: ApiProvider) => ApiProvider,
 ): Promise<{
   testCases: TestCaseWithPlugin[];
   strategyResults: Record<string, { requested: number; generated: number }>;
@@ -612,11 +677,17 @@ async function applyStrategies(
       {
         ...(strategy.config || {}),
         ...(maxCharsPerMessage ? { maxCharsPerMessage } : {}),
-        // Pass redteam provider from config so agentic strategies (iterative, crescendo, etc.) can use it
-        redteamProvider: cliState.config?.redteam?.provider,
         excludeTargetOutputFromAgenticAttackGeneration,
+        ...remoteGenerationContextPayload(redteamGenerationContext),
       },
       strategy.id,
+      {
+        // Keep every local strategy phase on the provider already selected for this synthesis run.
+        // The source tells strategies whether the choice was explicit or an implicit default.
+        generationProviderSelection: providerSelection,
+        // Specialized local providers still need to contribute to generation usage totals.
+        wrapGenerationProvider,
+      },
     );
 
     // Filter out null/undefined
@@ -647,7 +718,7 @@ async function applyStrategies(
           const { inputMaterialization, vars } = await rematerializeStrategyInputVars(
             t,
             injectVar,
-            provider,
+            providerSelection.provider,
             purpose,
             materializationIndex,
           );
@@ -836,11 +907,7 @@ export function calculateTotalTests(
   // Calculate total plugin tests accounting for multiple languages
   // Each plugin's tests are multiplied by the number of languages when multiple languages are configured
   const totalPluginTests = plugins.reduce((sum, p) => {
-    const pluginLanguageConfig = p.config?.language ?? language;
-    const pluginLanguageCount = Array.isArray(pluginLanguageConfig)
-      ? pluginLanguageConfig.length
-      : 1;
-    return sum + (p.numTests || 0) * pluginLanguageCount;
+    return sum + getExpectedPluginTestCount(p, language);
   }, 0);
 
   // When there are no strategies, or only a disabled basic strategy
@@ -895,6 +962,7 @@ function isStrategyCollection(id: string): id is keyof typeof STRATEGY_COLLECTIO
  */
 export async function synthesize({
   abortSignal,
+  cloudTargetDatabaseId: explicitCloudTargetDatabaseId,
   delay,
   entities: entitiesOverride,
   injectVar,
@@ -906,6 +974,7 @@ export async function synthesize({
   prompts,
   provider,
   purpose: purposeOverride,
+  redteamGenerationContext: inputRedteamGenerationContext,
   strategies,
   targetIds,
   showProgressBar: showProgressBarOverride,
@@ -917,6 +986,7 @@ export async function synthesize({
   testCases: TestCaseWithPlugin[];
   injectVar: string;
   failedPlugins: FailedPluginInfo[];
+  generationTokenUsage?: TokenUsage;
 }> {
   // Add abort check helper
   const checkAbort = () => {
@@ -935,6 +1005,13 @@ export async function synthesize({
     maxConcurrency = 1;
     logger.warn('Delay is enabled, setting max concurrency to 1.');
   }
+
+  const redteamGenerationContext = resolveRedteamGenerationContext({
+    cloudTargetDatabaseId: explicitCloudTargetDatabaseId,
+    redteamGenerationContext: inputRedteamGenerationContext,
+    targetIds,
+  });
+  const cloudTargetId = redteamGenerationContext.cloudTargetId;
 
   if (maxConcurrency > MAX_MAX_CONCURRENCY) {
     maxConcurrency = MAX_MAX_CONCURRENCY;
@@ -998,9 +1075,24 @@ export async function synthesize({
   await validateStrategies(strategies);
   await validateSharpDependency(strategies, plugins);
 
-  const redteamProvider = await redteamProviderManager.getProvider({
+  const providerSelection = await redteamProviderManager.getProviderSelection({
     provider,
   });
+  const generationTokenUsage: TokenUsage = {
+    cached: 0,
+    completion: 0,
+    numRequests: 0,
+    prompt: 0,
+    total: 0,
+  };
+  const redteamProvider = trackGenerationTokenUsage(
+    providerSelection.provider,
+    generationTokenUsage,
+  );
+  const trackedProviderSelection = {
+    ...providerSelection,
+    provider: redteamProvider,
+  };
 
   const { effectiveStrategyCount, includeBasicTests, totalPluginTests, totalTests } =
     calculateTotalTests(plugins, strategies, language);
@@ -1012,11 +1104,7 @@ export async function synthesize({
       plugins
         .map((p) => {
           // Calculate actual test count accounting for multiple languages
-          const pluginLanguageConfig = p.config?.language ?? language;
-          const pluginLanguageCount = Array.isArray(pluginLanguageConfig)
-            ? pluginLanguageConfig.length
-            : 1;
-          const actualTestCount = (p.numTests || 0) * pluginLanguageCount;
+          const actualTestCount = getExpectedPluginTestCount(p, language);
           // Build a concise display string for the plugin
           let configSummary = '';
           if (p.config) {
@@ -1040,8 +1128,10 @@ export async function synthesize({
               // For other plugins with config, just indicate config exists
               configSummary = ' (custom config)';
             }
-            // Log full config at debug level for troubleshooting (structured for auto-sanitization)
-            logger.debug('Plugin config', { pluginId: p.id, config: p.config });
+            logger.debug('Plugin config', {
+              pluginId: p.id,
+              configKeyCount: Object.keys(p.config).length,
+            });
           }
           return `${p.id} (${formatTestCount(actualTestCount, false)})${configSummary}`;
         })
@@ -1256,7 +1346,9 @@ export async function synthesize({
   } else {
     logger.info('Extracting system purpose...');
   }
-  const purpose = purposeOverride || (await extractSystemPurpose(redteamProvider, prompts));
+  const purpose =
+    purposeOverride ||
+    (await extractSystemPurpose(redteamProvider, prompts, redteamGenerationContext));
 
   if (showProgressBar) {
     progressBar?.update({ task: 'Extracting entities' });
@@ -1265,7 +1357,7 @@ export async function synthesize({
   }
   const entities: string[] = Array.isArray(entitiesOverride)
     ? entitiesOverride
-    : await extractEntities(redteamProvider, prompts);
+    : await extractEntities(redteamProvider, prompts, redteamGenerationContext);
 
   logger.debug(`System purpose: ${purpose}`);
 
@@ -1308,6 +1400,8 @@ export async function synthesize({
           injectVar,
           n: plugin.numTests,
           delayMs: delay || 0,
+          targetId: cloudTargetId,
+          redteamGenerationContext,
           config: {
             ...resolvePluginConfigWithMaxChars(plugin.config, maxCharsPerMessage),
             ...(lang ? { language: lang } : {}),
@@ -1400,7 +1494,14 @@ export async function synthesize({
             const prompt = Array.isArray(promptVar) ? promptVar[0] : String(promptVar);
 
             const policy = getPolicyText(testCase.metadata);
-            const extractedGoal = await extractGoalFromPrompt(prompt, purpose, plugin.id, policy);
+            const extractedGoal = await extractGoalFromPrompt(
+              prompt,
+              purpose,
+              plugin.id,
+              policy,
+              cloudTargetId,
+              redteamProvider,
+            );
 
             (testCase.metadata as any).goal = extractedGoal;
           }
@@ -1411,7 +1512,11 @@ export async function synthesize({
       }
 
       if (showProgressBar) {
-        progressBar?.increment(plugin.numTests * languages.length);
+        // Increment by expected count so the bar's running total stays aligned
+        // with `totalTests` (which is computed from `getExpectedPluginTestCount`).
+        // For intent, the helper now resolves `file://` references so the expected
+        // count matches what was actually generated in the happy path.
+        progressBar?.increment(getExpectedPluginTestCount(plugin, language));
       } else {
         logger.info(`Generated ${allPluginTests.length} tests for ${plugin.id}`);
       }
@@ -1437,7 +1542,9 @@ export async function synthesize({
       } else {
         // Single language or no language - use aggregated result
         const requested =
-          plugin.id === 'intent' ? allPluginTests.length : plugin.numTests * languages.length;
+          plugin.id === 'intent'
+            ? allPluginTests.length
+            : getExpectedPluginTestCount(plugin, language);
         const generated = allPluginTests.length;
         pluginResults[baseDisplayId] = { requested, generated };
       }
@@ -1526,7 +1633,14 @@ export async function synthesize({
             const prompt = Array.isArray(promptVar) ? promptVar[0] : String(promptVar);
 
             const policy = getPolicyText(testCase.metadata);
-            const extractedGoal = await extractGoalFromPrompt(prompt, purpose, plugin.id, policy);
+            const extractedGoal = await extractGoalFromPrompt(
+              prompt,
+              purpose,
+              plugin.id,
+              policy,
+              cloudTargetId,
+              redteamProvider,
+            );
 
             (testCase.metadata as any).goal = extractedGoal;
           }
@@ -1546,12 +1660,12 @@ export async function synthesize({
           }
         } else {
           pluginResults[baseDisplayId] = {
-            requested: plugin.numTests * languages.length,
+            requested: getExpectedPluginTestCount(plugin, language),
             generated: allCustomTests.length,
           };
         }
 
-        progressBar?.increment(plugin.numTests * languages.length);
+        progressBar?.increment(getExpectedPluginTestCount(plugin, language));
       } catch (e) {
         logger.error(`Error generating tests for custom plugin ${plugin.id}: ${e}`);
         const displayId = getPluginDisplayId(plugin);
@@ -1579,17 +1693,19 @@ export async function synthesize({
     }
     logger.debug('Applying retry strategy first');
     retryStrategy.config = {
-      targetIds,
+      targetIds: redteamGenerationContext.providerTargetIds,
       ...retryStrategy.config,
     };
     const { testCases: retryTestCases, strategyResults: retryResults } = await applyStrategies(
       pluginTestCases,
       [retryStrategy],
       injectVar,
-      redteamProvider,
+      trackedProviderSelection,
       purpose,
       undefined,
       maxCharsPerMessage,
+      redteamGenerationContext,
+      (providerToWrap) => trackGenerationTokenUsage(providerToWrap, generationTokenUsage),
     );
     pluginTestCases.push(...retryTestCases);
     Object.assign(strategyResults, retryResults);
@@ -1610,10 +1726,12 @@ export async function synthesize({
       pluginTestCases,
       nonBasicStrategies,
       injectVar,
-      redteamProvider,
+      trackedProviderSelection,
       purpose,
       excludeTargetOutputFromAgenticAttackGeneration,
       maxCharsPerMessage,
+      redteamGenerationContext,
+      (providerToWrap) => trackGenerationTokenUsage(providerToWrap, generationTokenUsage),
     );
 
   Object.assign(strategyResults, otherStrategyResults);
@@ -1642,5 +1760,12 @@ export async function synthesize({
     .filter(([_, { requested, generated }]) => requested > 0 && generated === 0)
     .map(([pluginId, { requested }]) => ({ pluginId, requested }));
 
-  return { purpose, entities, testCases: finalTestCases, injectVar, failedPlugins };
+  return {
+    purpose,
+    entities,
+    testCases: finalTestCases,
+    injectVar,
+    failedPlugins,
+    generationTokenUsage,
+  };
 }

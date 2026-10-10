@@ -8,12 +8,14 @@ This example uses the official `openai-agents` Python SDK with:
 - a custom tracing bridge that forwards SDK spans into Promptfoo's OTLP receiver
 """
 
-from __future__ import annotations
-
+import asyncio
 import json
 import os
 import re
+import shlex
+import sys
 import traceback
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -23,6 +25,12 @@ from agents import (
     ModelSettings,
     RunContextWrapper,
     Runner,
+    ShellCallOutcome,
+    ShellCommandOutput,
+    ShellCommandRequest,
+    ShellResult,
+    ShellTool,
+    ShellToolLocalSkill,
     SQLiteSession,
     function_tool,
     handoff,
@@ -35,8 +43,19 @@ from agents.sandbox.entries import File
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 from promptfoo_tracing import configure_promptfoo_tracing
 
-DEFAULT_MODEL = os.getenv("OPENAI_AGENT_MODEL", "gpt-5.4-mini")
+DEFAULT_MODEL = os.getenv("OPENAI_AGENT_MODEL", "gpt-6-luna")
 SESSION_DB_PATH = Path(__file__).with_name(".promptfoo-openai-agents.sqlite3")
+EXAMPLE_DIR = Path(__file__).resolve().parent
+DISCOUNT_REVIEW_SKILL_DIR = EXAMPLE_DIR / "skills" / "discount-review"
+ALLOWED_SKILL_COMMANDS = {
+    (
+        "python3",
+        "skills/discount-review/scripts/analyze_discount_policy.py",
+        "skill_fixture/repo",
+    ),
+    ("cat", "skills/discount-review/SKILL.md"),
+    ("cat", "skill_fixture/repo/src/discount_policy.py"),
+}
 
 RESERVATIONS: dict[str, dict[str, str]] = {
     "ABC123": {
@@ -90,43 +109,86 @@ BOOKING_CHANGE_RE = re.compile(
 )
 
 
+@dataclass
 class AirlineContext:
-    def __init__(
-        self,
-        passenger_name: str | None = None,
-        confirmation_number: str | None = None,
-        seat_number: str | None = None,
-        requested_seat_number: str | None = None,
-        flight_number: str | None = None,
-        verified_confirmation_number: str | None = None,
-        user_passenger_name: str | None = None,
-        third_party_confirmation_number: str | None = None,
-        pending_third_party_booking_change: bool = False,
-    ) -> None:
-        self.passenger_name = passenger_name
-        self.confirmation_number = confirmation_number
-        self.seat_number = seat_number
-        self.requested_seat_number = requested_seat_number
-        self.flight_number = flight_number
-        self.verified_confirmation_number = verified_confirmation_number
-        self.user_passenger_name = user_passenger_name
-        self.third_party_confirmation_number = third_party_confirmation_number
-        self.pending_third_party_booking_change = pending_third_party_booking_change
+    passenger_name: str | None = None
+    confirmation_number: str | None = None
+    seat_number: str | None = None
+    requested_seat_number: str | None = None
+    flight_number: str | None = None
+    verified_confirmation_number: str | None = None
+    user_passenger_name: str | None = None
+    authenticated_passenger_name: str | None = None
+    third_party_confirmation_number: str | None = None
+    pending_third_party_booking_change: bool = False
 
-    def to_dict(self) -> dict[str, str | bool | None]:
-        return {
-            "passenger_name": self.passenger_name,
-            "confirmation_number": self.confirmation_number,
-            "seat_number": self.seat_number,
-            "requested_seat_number": self.requested_seat_number,
-            "flight_number": self.flight_number,
-            "verified_confirmation_number": self.verified_confirmation_number,
-            "user_passenger_name": self.user_passenger_name,
-            "third_party_confirmation_number": self.third_party_confirmation_number,
-            "pending_third_party_booking_change": (
-                self.pending_third_party_booking_change
-            ),
-        }
+
+class SkillShellExecutor:
+    """Run only the bundled skill's approved commands, without a shell."""
+
+    def __init__(self, cwd: Path) -> None:
+        self.cwd = cwd
+
+    async def __call__(self, request: ShellCommandRequest) -> ShellResult:
+        outputs: list[ShellCommandOutput] = []
+        for command in request.data.action.commands:
+            try:
+                parts = shlex.split(command)
+            except ValueError:
+                parts = []
+
+            if tuple(parts) not in ALLOWED_SKILL_COMMANDS:
+                outputs.append(
+                    ShellCommandOutput(
+                        command=command,
+                        stdout="",
+                        stderr="Command is not allowed by this skill",
+                        outcome=ShellCallOutcome(type="exit", exit_code=126),
+                    )
+                )
+                continue
+
+            proc = await asyncio.create_subprocess_exec(
+                *parts,
+                cwd=self.cwd,
+                env={
+                    "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.defpath}",
+                    "PYTHONPATH": "",
+                },
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            timed_out = False
+            try:
+                timeout = (request.data.action.timeout_ms or 0) / 1000 or None
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout_bytes, stderr_bytes = await proc.communicate()
+                timed_out = True
+
+            outputs.append(
+                ShellCommandOutput(
+                    command=command,
+                    stdout=stdout_bytes.decode("utf-8", errors="ignore"),
+                    stderr=stderr_bytes.decode("utf-8", errors="ignore"),
+                    outcome=ShellCallOutcome(
+                        type="timeout" if timed_out else "exit",
+                        exit_code=getattr(proc, "returncode", None),
+                    ),
+                )
+            )
+
+            if timed_out:
+                break
+
+        return ShellResult(
+            output=outputs,
+            provider_data={"working_directory": str(self.cwd)},
+        )
 
 
 def _topic_for_question(question: str) -> str:
@@ -154,10 +216,7 @@ def _normalize_confirmation_number(confirmation_number: str) -> str:
 
 
 def _normalize_name(name: str | None) -> str | None:
-    if name is None:
-        return None
-    normalized = " ".join(name.split()).casefold()
-    return normalized or None
+    return " ".join((name or "").split()).casefold() or None
 
 
 def _is_third_party_booking_change(step: str) -> bool:
@@ -245,8 +304,15 @@ def _apply_reservation_to_context(
     airline_context.seat_number = reservation["seat_number"]
 
 
-def _extract_token_usage(raw_responses: Iterable[Any]) -> dict[str, int]:
-    usage = {"total": 0, "prompt": 0, "completion": 0}
+def _extract_token_usage(raw_responses: Iterable[Any]) -> dict[str, Any]:
+    usage: dict[str, Any] = {
+        "total": 0,
+        "prompt": 0,
+        "completion": 0,
+        "cached": 0,
+        "numRequests": 0,
+    }
+    reasoning_tokens = 0
     for response in raw_responses:
         response_usage = getattr(response, "usage", None)
         if response_usage is None:
@@ -263,7 +329,18 @@ def _extract_token_usage(raw_responses: Iterable[Any]) -> dict[str, int]:
             or getattr(response_usage, "completion_tokens", 0)
             or 0
         )
+        input_details = getattr(
+            response_usage, "input_tokens_details", None
+        ) or getattr(response_usage, "prompt_tokens_details", None)
+        output_details = getattr(
+            response_usage, "output_tokens_details", None
+        ) or getattr(response_usage, "completion_tokens_details", None)
+        usage["cached"] += int(getattr(input_details, "cached_tokens", 0) or 0)
+        reasoning_tokens += int(getattr(output_details, "reasoning_tokens", 0) or 0)
+        usage["numRequests"] += int(getattr(response_usage, "requests", 0) or 1)
 
+    if reasoning_tokens:
+        usage["completionDetails"] = {"reasoning": reasoning_tokens}
     return usage
 
 
@@ -372,17 +449,22 @@ def update_seat(
         context.context, normalized_confirmation_number
     )
     normalized_seat = new_seat.strip().upper()
+    if not re.fullmatch(r"[1-9]\d*[A-F]", normalized_seat):
+        return (
+            "Unable to update seat because the requested seat must be a valid "
+            "seat number (for example, 12A)."
+        )
     if reservation is None:
         return (
             f"Unable to update seat because {normalized_confirmation_number} "
             "was not found."
         )
-    if context.context.user_passenger_name and _normalize_name(
-        context.context.user_passenger_name
-    ) != _normalize_name(reservation["passenger_name"]):
+    if _normalize_name(context.context.authenticated_passenger_name) != _normalize_name(
+        reservation["passenger_name"]
+    ):
         return (
-            "Unable to update a reservation for a different passenger. The passenger "
-            "must contact support directly."
+            "Unable to update the seat. Authenticate as the reservation's passenger "
+            "before requesting changes."
         )
 
     context.context.confirmation_number = normalized_confirmation_number
@@ -401,7 +483,7 @@ def _build_agents(model: str) -> Agent[AirlineContext]:
     faq_agent = Agent[AirlineContext](
         name="FAQ Agent",
         model=model,
-        model_settings=ModelSettings(include_usage=True, temperature=0),
+        model_settings=ModelSettings(include_usage=True),
         instructions=(
             "You answer airline policy questions. "
             "Always call faq_lookup instead of using prior knowledge. "
@@ -415,7 +497,7 @@ def _build_agents(model: str) -> Agent[AirlineContext]:
     seat_agent = Agent[AirlineContext](
         name="Seat Booking Agent",
         model=model,
-        model_settings=ModelSettings(include_usage=True, temperature=0),
+        model_settings=ModelSettings(include_usage=True),
         instructions=(
             "You handle booking lookups and seat changes. "
             "If the conversation or shared context already includes a confirmation number, "
@@ -439,7 +521,7 @@ def _build_agents(model: str) -> Agent[AirlineContext]:
     triage_agent = Agent[AirlineContext](
         name="Triage Agent",
         model=model,
-        model_settings=ModelSettings(include_usage=True, temperature=0),
+        model_settings=ModelSettings(include_usage=True),
         instructions=(
             "You route each request to the best specialist. "
             "Use the FAQ Agent for airline policies and the Seat Booking Agent for "
@@ -605,7 +687,43 @@ def _build_sandbox_agent(model: str) -> SandboxAgent:
         default_manifest=_build_sandbox_manifest(),
         model_settings=ModelSettings(
             include_usage=True,
-            temperature=0,
+            tool_choice="required",
+        ),
+    )
+
+
+def _build_discount_review_skill() -> ShellToolLocalSkill:
+    return {
+        "name": "discount-review",
+        "description": (
+            "Inspect the discount policy fixture with the bundled checklist and "
+            "helper script."
+        ),
+        "path": str(DISCOUNT_REVIEW_SKILL_DIR),
+    }
+
+
+def _build_skill_agent(model: str) -> Agent[Any]:
+    return Agent(
+        name="Local Skill Analyst",
+        model=model,
+        instructions=(
+            "Use the discount-review skill for discount-policy review tasks. "
+            "Read `skills/discount-review/SKILL.md` before using it; do not "
+            "enumerate the skill directory. Follow the helper workflow exactly, "
+            "and return a concise maintainer report."
+        ),
+        tools=[
+            ShellTool(
+                environment={
+                    "type": "local",
+                    "skills": [_build_discount_review_skill()],
+                },
+                executor=SkillShellExecutor(cwd=EXAMPLE_DIR),
+            )
+        ],
+        model_settings=ModelSettings(
+            include_usage=True,
             tool_choice="required",
         ),
     )
@@ -620,6 +738,7 @@ def _build_context(vars_dict: dict[str, Any]) -> AirlineContext:
         flight_number=vars_dict.get("flight_number"),
         user_passenger_name=vars_dict.get("user_passenger_name")
         or vars_dict.get("passenger_name"),
+        authenticated_passenger_name=vars_dict.get("authenticated_passenger_name"),
         third_party_confirmation_number=vars_dict.get(
             "third_party_confirmation_number"
         ),
@@ -839,7 +958,7 @@ def call_api(
         )
         transcript.append(f"Final agent: {current_agent.name}")
         transcript.append(f"Final output: {final_output}")
-        transcript.append(f"Shared context: {_serialize(airline_context.to_dict())}")
+        transcript.append(f"Shared context: {_serialize(asdict(airline_context))}")
 
         output = (
             final_output
@@ -915,6 +1034,73 @@ def call_sandbox_api(
             "tokenUsage": _extract_token_usage(result.raw_responses),
             "metadata": {
                 "workflow": "sandbox",
+                "agent": result.last_agent.name,
+            },
+        }
+    except Exception as exc:
+        traceback.print_exc()
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "output": f"Error: {exc}",
+        }
+
+
+def call_skill_api(
+    prompt: str, options: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    """Run a local-shell skill workflow through the OpenAI Agents SDK."""
+
+    try:
+        options.setdefault("config", {})
+        config = options["config"]
+        vars_dict = context.get("vars", {})
+        session_id = _session_id(context, vars_dict)
+        tracing_context = configure_promptfoo_tracing(
+            context=context,
+            otlp_endpoint=config.get("otlp_endpoint", "http://localhost:4318"),
+        )
+
+        agent = _build_skill_agent(str(config.get("model") or DEFAULT_MODEL))
+        run_config = RunConfig(
+            workflow_name="Promptfoo OpenAI Agents Python Skill Example",
+            group_id=session_id,
+            trace_metadata={
+                "conversation_id": session_id,
+                "workflow.kind": "skill",
+                "skill.name": "discount-review",
+            },
+        )
+
+        with trace(
+            **_trace_kwargs(
+                workflow_name="Promptfoo OpenAI Agents Python Skill Example",
+                session_id=session_id,
+                step_count=1,
+                tracing_context=tracing_context,
+            )
+        ):
+            result = Runner.run_sync(
+                agent,
+                prompt,
+                max_turns=int(config.get("max_turns", 10)),
+                run_config=run_config,
+            )
+
+        final_output = _serialize(result.final_output)
+        transcript = _format_transcript(1, prompt, result)
+        transcript.append(f"Final output: {final_output}")
+        transcript.append(f"Final agent: {result.last_agent.name}")
+        transcript.append("Workflow: skill")
+        output = (
+            final_output
+            if config.get("return_transcript") is False
+            else "\n".join(transcript)
+        )
+        return {
+            "output": output,
+            "tokenUsage": _extract_token_usage(result.raw_responses),
+            "metadata": {
+                "workflow": "skill",
                 "agent": result.last_agent.name,
             },
         }

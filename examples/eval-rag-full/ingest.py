@@ -9,14 +9,15 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from langchain.docstore.document import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pdf_loader import load_pdf_pages
 from tqdm import tqdm
 
 # Configure logging
@@ -29,7 +30,8 @@ OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
-CHROMA_PATH: str = "db"
+EXAMPLE_DIR: Path = Path(__file__).resolve().parent
+CHROMA_PATH: str = str(EXAMPLE_DIR / "db")
 BASE_URL: str = "https://storage.googleapis.com/promptfoo-public-1/examples/rag-sec/"
 CHUNK_SIZE: int = 500
 CHUNK_OVERLAP: int = 50
@@ -73,8 +75,7 @@ def process_single_pdf(pdf_file: str) -> Tuple[str, List[Document]]:
     """
     doc_url: str = BASE_URL + quote(pdf_file)
     try:
-        loader: PyPDFLoader = PyPDFLoader(doc_url)
-        pages: List[Document] = loader.load()
+        pages: List[Document] = load_pdf_pages(doc_url)
         text_splitter: RecursiveCharacterTextSplitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
         )

@@ -1,6 +1,6 @@
-import { getEnvString } from '../../envars';
 import logger from '../../logger';
 import invariant from '../../util/invariant';
+import { resolveProviderApiKey } from '../credentials';
 import {
   buildStructuredImageOutputs,
   callOpenAiImageApi,
@@ -8,6 +8,7 @@ import {
   OpenAiImageProvider,
 } from '../openai/image';
 import { getRequestTimeoutMs } from '../shared';
+import { getXAICostInUsd } from './chat';
 
 import type { EnvOverrides } from '../../types/env';
 import type {
@@ -19,9 +20,29 @@ import type { ApiProvider } from '../../types/providers';
 import type { OpenAiSharedOptions } from '../openai/types';
 
 type XaiImageOptions = OpenAiSharedOptions & {
+  region?: string;
   n?: number;
   response_format?: 'url' | 'b64_json';
   user?: string;
+  aspect_ratio?: string;
+  quality?: 'low' | 'medium' | 'high' | 'auto';
+  resolution?: '1k' | '2k';
+  image?: { url: string };
+  images?: { url: string }[];
+  mask?: { url: string };
+};
+
+/**
+ * Per-image price for grok-imagine-image-2.0, keyed by `${quality}_${resolution}`.
+ * Unlike the other Imagine models it prices per tier rather than at a flat rate.
+ * Sourced from the `pricing` array of xAI's `/v1/models/grok-imagine-image-2.0`
+ * (USD ticks at $1e-10 each), verified live 2026-08-31.
+ */
+const IMAGINE_IMAGE_2_0_COSTS: Record<string, number> = {
+  low_1k: 0.04,
+  low_2k: 0.06,
+  medium_1k: 0.06,
+  medium_2k: 0.08,
 };
 
 export class XAIImageProvider extends OpenAiImageProvider {
@@ -31,25 +52,34 @@ export class XAIImageProvider extends OpenAiImageProvider {
     modelName: string,
     options: { config?: XaiImageOptions; id?: string; env?: EnvOverrides } = {},
   ) {
+    const userConfig = options.config || {};
+    // Resolve the base URL up front so `region` actually takes effect: the OpenAI
+    // base provider reads `config.apiBaseUrl` directly and never calls our
+    // `getApiUrlDefault()` when it's set, so an unconditional default would
+    // silently swallow a regional override.
+    const apiBaseUrl =
+      userConfig.apiBaseUrl ??
+      (userConfig.region ? `https://${userConfig.region}.api.x.ai/v1` : 'https://api.x.ai/v1');
+
     super(modelName, {
       ...options,
       config: {
-        ...options.config,
+        ...userConfig,
         apiKeyEnvar: 'XAI_API_KEY',
-        apiBaseUrl: 'https://api.x.ai/v1',
+        apiBaseUrl,
       },
     });
-    this.config = options.config || {};
+    this.config = userConfig;
   }
 
   getApiKey(): string | undefined {
-    if (this.config?.apiKey) {
-      return this.config.apiKey;
-    }
-    return getEnvString('XAI_API_KEY');
+    return resolveProviderApiKey(this.config, this.env, ['XAI_API_KEY']);
   }
 
   getApiUrlDefault(): string {
+    if (this.config.region) {
+      return `https://${this.config.region}.api.x.ai/v1`;
+    }
     return 'https://api.x.ai/v1';
   }
 
@@ -63,15 +93,75 @@ export class XAIImageProvider extends OpenAiImageProvider {
 
   private getApiModelName(): string {
     const modelMap: Record<string, string> = {
+      'grok-imagine-image': 'grok-imagine-image',
+      // Dated alias for grok-imagine-image, as listed by xAI's image-generation-models API.
+      'grok-imagine-image-2026-03-02': 'grok-imagine-image',
+      'grok-imagine-image-2.0': 'grok-imagine-image-2.0',
+      'grok-imagine-image-quality': 'grok-imagine-image-quality',
+      // xAI exposes dated and -latest aliases for the quality model; route them to
+      // the canonical slug so fallback pricing and request routing stay consistent.
+      'grok-imagine-image-quality-latest': 'grok-imagine-image-quality',
+      'grok-imagine-image-quality-20260403': 'grok-imagine-image-quality',
+      'grok-imagine-image-pro': 'grok-imagine-image-pro',
       'grok-2-image': 'grok-2-image',
       'grok-image': 'grok-2-image',
     };
-    return modelMap[this.modelName] || 'grok-2-image';
+    if (modelMap[this.modelName]) {
+      return modelMap[this.modelName];
+    }
+    // Preserve unknown Grok Imagine slugs as-is rather than silently routing
+    // them to the legacy `grok-2-image` model. This avoids surprising downgrades
+    // when xAI publishes new aliases that promptfoo has not yet indexed.
+    if (this.modelName.startsWith('grok-imagine-')) {
+      return this.modelName;
+    }
+    return 'grok-2-image';
   }
 
-  private calculateImageCost(n: number = 1): number {
-    // xAI pricing: $0.07 per generated image for grok-2-image
+  private calculateImageCost(
+    model: string,
+    n: number = 1,
+    resolution: XaiImageOptions['resolution'] = '1k',
+    sourceImageCount: number = 0,
+    quality?: XaiImageOptions['quality'],
+    isEdit: boolean = false,
+  ): number {
+    // grok-imagine-image-pro is redirected to the quality model after
+    // 2026-05-15; any other unrecognized grok-imagine-* slug (e.g. a future
+    // alias promptfoo has not indexed) is priced at the quality tier too,
+    // rather than falling through to legacy grok-2-image pricing. Models with
+    // their own pricing table are excluded so they are not swept into that bucket.
+    const pricingModel =
+      model.startsWith('grok-imagine-') &&
+      model !== 'grok-imagine-image' &&
+      model !== 'grok-imagine-image-2.0'
+        ? 'grok-imagine-image-quality'
+        : model;
+
+    if (pricingModel === 'grok-imagine-image') {
+      return 0.02 * n + 0.002 * sourceImageCount;
+    }
+    if (pricingModel === 'grok-imagine-image-2.0') {
+      // `auto` (and an unset quality) currently serves low for generations but medium
+      // for edits. Anything else (e.g. `high`, which the API rejects) falls back to
+      // the most expensive tier so an estimate never undercharges.
+      const autoTier = isEdit ? 'medium' : 'low';
+      const tier = !quality || quality === 'auto' ? autoTier : quality === 'low' ? 'low' : 'medium';
+      const perImage =
+        IMAGINE_IMAGE_2_0_COSTS[`${tier}_${resolution}`] ?? IMAGINE_IMAGE_2_0_COSTS.medium_2k;
+      return perImage * n + 0.01 * sourceImageCount;
+    }
+    if (pricingModel === 'grok-imagine-image-quality') {
+      const perImage = resolution === '2k' ? 0.07 : 0.05;
+      return perImage * n + 0.01 * sourceImageCount;
+    }
+
+    // Legacy grok-2-image pricing.
     return 0.07 * n;
+  }
+
+  private countSourceImages(config: XaiImageOptions): number {
+    return Number(Boolean(config.image)) + (config.images?.length || 0);
   }
 
   async callApi(
@@ -92,7 +182,8 @@ export class XAIImageProvider extends OpenAiImageProvider {
 
     const model = this.getApiModelName();
     const responseFormat = config.response_format || 'url';
-    const endpoint = '/images/generations';
+    const isEdit = Boolean(config.image || config.images?.length || config.mask);
+    const endpoint = isEdit ? '/images/edits' : '/images/generations';
 
     const body: Record<string, any> = {
       model,
@@ -100,6 +191,24 @@ export class XAIImageProvider extends OpenAiImageProvider {
       n: config.n || 1,
       response_format: responseFormat,
     };
+    if (config.aspect_ratio) {
+      body.aspect_ratio = config.aspect_ratio;
+    }
+    if (config.quality) {
+      body.quality = config.quality;
+    }
+    if (config.resolution) {
+      body.resolution = config.resolution;
+    }
+    if (config.image) {
+      body.image = config.image;
+    }
+    if (config.images?.length) {
+      body.images = config.images;
+    }
+    if (config.mask) {
+      body.mask = config.mask;
+    }
     if (config.user) {
       body.user = config.user;
     }
@@ -146,7 +255,18 @@ export class XAIImageProvider extends OpenAiImageProvider {
         return formattedOutput;
       }
 
-      const cost = cached ? 0 : this.calculateImageCost(config.n || 1);
+      const reportedCost = getXAICostInUsd(data.usage);
+      const cost = cached
+        ? 0
+        : (reportedCost ??
+          this.calculateImageCost(
+            model,
+            config.n || 1,
+            config.resolution,
+            this.countSourceImages(config),
+            config.quality,
+            isEdit,
+          ));
       const images = buildStructuredImageOutputs(data);
 
       return {

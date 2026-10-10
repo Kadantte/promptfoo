@@ -91,6 +91,13 @@ describe('SessionsTab', () => {
         const headerKeyInputs = screen.getAllByPlaceholderText('Header name');
         const headerValueInputs = screen.getAllByPlaceholderText('Header value');
 
+        expect(headerKeyInputs[0].parentElement).toHaveClass(
+          'flex-col',
+          'items-stretch',
+          'sm:flex-row',
+          'sm:items-center',
+        );
+
         await user.click(headerKeyInputs[0]);
         await user.keyboard('{Control>}a{/Control}');
         await user.paste('Authorization');
@@ -207,10 +214,7 @@ describe('SessionsTab', () => {
           />,
         );
 
-        const removeButtons = screen.getAllByRole('button', { name: '' }).filter((btn) => {
-          const svg = btn.querySelector('svg');
-          return svg?.classList.contains('lucide-trash-2');
-        });
+        const removeButtons = screen.getAllByRole('button', { name: /remove header/i });
 
         const initialCount = removeButtons.length;
 
@@ -241,10 +245,7 @@ describe('SessionsTab', () => {
           />,
         );
 
-        const removeButtons = screen.getAllByRole('button', { name: '' }).filter((btn) => {
-          const svg = btn.querySelector('svg');
-          return svg?.classList.contains('lucide-trash-2');
-        });
+        const removeButtons = screen.getAllByRole('button', { name: /remove header/i });
 
         await user.click(removeButtons[0]);
 
@@ -504,6 +505,64 @@ describe('SessionsTab', () => {
       expect(sessionCalls.length).toBe(0);
     });
   });
+
+  it.each(['llamafile', 'vllm', 'text-generation-webui'] as const)(
+    'normalizes %s local session requests without changing editable references',
+    async (type) => {
+      const target = {
+        id: 'openai:chat',
+        label: 'Local target',
+        config: {
+          type,
+          model: 'tenant/model:Q4',
+          apiBaseUrl: 'https://local.example.test/v1',
+          apiKeyEnvar: 'LOCAL_MODEL_KEY',
+          useDefaultApiKey: '{{ env.LOCAL_SOURCE }}',
+          stop: ['<end>'],
+        },
+      };
+
+      const user = userEvent.setup();
+      const selectedTarget = {
+        ...target,
+        config: {
+          ...target.config,
+          url: 'https://local.example.test/v1/chat/completions',
+          stateful: true,
+          sessionSource: 'server' as const,
+          sessionParser: 'json.sessionId',
+        },
+      };
+      const original = JSON.parse(JSON.stringify(selectedTarget));
+      vi.mocked(callApi).mockResolvedValue({
+        ok: true,
+        json: async () => ({ success: true }),
+      } as Response);
+      render(
+        <SessionsTab
+          selectedTarget={selectedTarget}
+          updateCustomTarget={mockUpdateCustomTarget}
+          onTestComplete={mockOnTestComplete}
+        />,
+      );
+      await user.click(screen.getByRole('button', { name: /test session/i }));
+      await waitFor(() =>
+        expect(callApi).toHaveBeenCalledWith('/providers/test-session', expect.anything()),
+      );
+      const request = vi
+        .mocked(callApi)
+        .mock.calls.find(([path]) => path === '/providers/test-session')![1]!;
+      expect(JSON.parse(request.body as string)).toEqual({
+        provider: {
+          ...selectedTarget,
+          config: { ...selectedTarget.config, apiKeyRequired: false, useDefaultApiKey: false },
+        },
+        sessionConfig: { sessionSource: 'server', sessionParser: 'json.sessionId' },
+      });
+      expect(selectedTarget).toEqual(original);
+      expect(mockUpdateCustomTarget).not.toHaveBeenCalled();
+    },
+  );
 
   describe('runSessionTest', () => {
     it('should call API with correct provider configuration', async () => {
@@ -1035,6 +1094,24 @@ describe('SessionsTab', () => {
 
       const testButton = screen.getByRole('button', { name: /test session/i });
       expect(testButton).toBeDisabled();
+    });
+
+    it('should enable session testing when the HTTP URL is stored in the provider ID', () => {
+      render(
+        <SessionsTab
+          selectedTarget={{
+            ...baseProvider,
+            id: 'https://api.example.com/chat',
+            config: { ...baseProvider.config, url: '' },
+          }}
+          updateCustomTarget={mockUpdateCustomTarget}
+        />,
+      );
+
+      expect(screen.getByRole('button', { name: /test session/i })).toBeEnabled();
+      expect(
+        screen.queryByText(/Please configure the target URL in the endpoint configuration/i),
+      ).toBeNull();
     });
   });
 

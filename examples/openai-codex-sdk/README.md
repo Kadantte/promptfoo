@@ -14,17 +14,17 @@ cd openai-codex-sdk
 Install the OpenAI Codex SDK:
 
 ```bash
-npm install @openai/codex-sdk
+npm install promptfoo @openai/codex-sdk@^0.156.1
 ```
 
-**Requirements**: Node.js 20.20+ or 22.22+
+**Requirements**: Node.js `>=22.22.0` and Codex SDK `^0.156.1` (at least `0.156.1`, below `0.157.0`) and its bundled CLI for these GPT-6 examples. Codex runs its own agent loop; providers such as `openai:gpt-6-sol` make direct model calls.
 
 Authenticate with Codex using one of these options:
 
 1. Sign in with ChatGPT through the Codex CLI:
 
 ```bash
-codex
+npx @openai/codex@^0.156.1 login
 ```
 
 2. Or set your OpenAI API key:
@@ -50,7 +50,7 @@ This basic example uses only deterministic string assertions, so it can run with
 **Usage**:
 
 ```bash
-(cd basic && promptfoo eval)
+(cd basic && npx promptfoo@latest eval)
 ```
 
 ### Skills Testing
@@ -72,14 +72,14 @@ This example demonstrates evaluating a local Codex skill stored under `.agents/s
 **Usage**:
 
 ```bash
-(cd skills && promptfoo eval)
+(cd skills && npx promptfoo@latest eval)
 
 # Trace the skill's internal command activity
-(cd skills && promptfoo eval -c promptfooconfig.tracing.yaml)
+(cd skills && npx promptfoo@latest eval -c promptfooconfig.tracing.yaml)
 ```
 
-If you run the config from a different working directory, set `CODEX_SKILLS_WORKING_DIR` and `CODEX_HOME_OVERRIDE` to absolute paths before invoking `promptfoo eval`.
-The default relative paths in these configs are intentionally subdirectory-relative for the `(cd skills && promptfoo eval)` workflow above.
+Relative `working_dir` values resolve from the config file's directory, so the sample project path stays stable regardless of where you invoke `promptfoo eval`. Codex resolves `CODEX_HOME` itself, so set `CODEX_HOME_OVERRIDE` to an absolute path when you run these configs from another working directory or need Codex to use a different home directory.
+The checked-in relative paths stay local to the config directory so the examples remain self-contained.
 
 The checked-in `sample-codex-home` fixture is intentionally empty of auth state. Use it with `OPENAI_API_KEY`/`CODEX_API_KEY`, or point `CODEX_HOME_OVERRIDE` at `$HOME/.codex` when you want to reuse a local Codex login.
 
@@ -89,14 +89,14 @@ This example compares two versions of the same local Codex skill against identic
 
 - **Versioned fixtures**: Each provider points at a different `working_dir` with its own `review-standards` skill
 - **Outcome scoring**: A JavaScript assertion scores issue recall and precision for each response
-- **Winner selection**: `max-score` picks the strongest skill version for each task after combining routing, correctness, cost, and latency signals
+- **Winner selection**: `max-score` picks the highest-scoring output for each task after combining routing, correctness, cost, and latency signals
 
 **Location**: `./skill-comparison/`
 
 **Usage**:
 
 ```bash
-(cd skill-comparison && promptfoo eval --no-cache)
+(cd skill-comparison && npx promptfoo@latest eval --no-cache)
 ```
 
 If you run this config from the repo root, set `CODEX_SKILL_COMPARE_V1_DIR` and `CODEX_SKILL_COMPARE_V2_DIR` to the absolute fixture paths first.
@@ -112,7 +112,7 @@ This example demonstrates `persist_threads: true` with one prompt template and m
 **Usage**:
 
 ```bash
-(cd thread-persistence && promptfoo eval)
+(cd thread-persistence && npx promptfoo@latest eval)
 ```
 
 ### Sandbox Enforcement
@@ -124,18 +124,32 @@ This example runs Codex in `read-only` mode and asks it to create a file. The as
 **Usage**:
 
 ```bash
-(cd sandbox && promptfoo eval)
+(cd sandbox && npx promptfoo@latest eval)
 ```
 
 If you run this config from the repo root, set `CODEX_SANDBOX_WORKING_DIR="$PWD/examples/openai-codex-sdk/sandbox/sample-workspace"`.
 
+### Run on Amazon Bedrock
+
+This example runs Codex against GPT-5.6 Sol, Terra, and Luna hosted on Amazon Bedrock by setting `model_provider: amazon-bedrock` with a Bedrock model ID (for example, `openai.gpt-5.6-sol`). It requires AWS credentials and Bedrock model access in a supported Region: `us-east-1`/`us-east-2` for Sol, plus `us-west-2` for Terra and Luna.
+
+**Location**: `./bedrock/`
+
+**Usage**:
+
+```bash
+(cd bedrock && npx promptfoo@latest eval --no-cache)
+```
+
+Export `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` first; they are forwarded to the Codex CLI via `config.cli_env`.
+
 ## Key Features
 
-- **Thread Persistence**: Conversations saved to `~/.codex/sessions`
+- **Thread Persistence**: Conversations saved under the active `CODEX_HOME` (by default, `~/.codex/sessions`)
 - **Git Integration**: Automatic repository detection (can be disabled)
 - **Structured Output**: Native JSON schema support with Zod
 - **Streaming Events**: Real-time progress updates
-- **Custom Binary**: Override Codex binary path with `codex_path_override`
+- **Custom Binary**: Override Codex binary path with `codex_path_override`; promptfoo verifies that its version matches the SDK pin unless `skip_codex_version_check: true` is set explicitly
 
 ## Configuration Options
 
